@@ -12,6 +12,7 @@ from saferoutes import config, risk_model
 
 
 def main() -> None:
+    """Run Phase 3: training table, models, scoring, and risk per intersection."""
     # 1. Load graph, lights and monthly counts
     # 2. Build static features + training table for all cut-offs
     #    (risk_model.make_cutoffs, build_static_node_features, build_training_table)

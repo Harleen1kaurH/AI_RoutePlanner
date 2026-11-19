@@ -86,6 +86,7 @@ def download_venues(
     features = ox.features_from_bbox(bbox, tags=tags)
 
     def column(name: str) -> pd.Series:
+        """The tag column `name`, or an empty column if no venue has that tag."""
         return features[name] if name in features else pd.Series(None, index=features.index, dtype=object)
 
     venue_id = [f"{kind}/{osm_id}" for kind, osm_id in features.index]   # index = (element type, id)
@@ -104,6 +105,7 @@ def download_venues(
 
 
 def main() -> None:
+    """Read the command-line options and download the chosen OpenStreetMap data."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--areas", action="store_true",
                         help="also download water, parks, parking and industrial areas")
@@ -145,6 +147,7 @@ def main() -> None:
 
 
 def _size_mb(path: Path) -> float:
+    """File size in megabytes, for the progress messages."""
     return path.stat().st_size / 1_000_000
 
 

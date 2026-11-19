@@ -11,6 +11,7 @@ from saferoutes import config, data_pipeline
 
 
 def main() -> None:
+    """Run Phase 1 and print each cleaning report and the saved file paths."""
     reports = data_pipeline.run()
     for report in reports:
         print(report)

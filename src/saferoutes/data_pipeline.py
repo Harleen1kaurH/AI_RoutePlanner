@@ -6,8 +6,9 @@ Output files (see config.py for the exact columns):
     config.CRIME_CLEAN, config.LIGHTS_CLEAN, config.STOPS_CLEAN,
     config.CALLS_CLEAN, config.VENUES_CLEAN, config.CLEANING_REPORT
 
-The OpenStreetMap street network is loaded in Phase 2
-(street_graph.download_walk_graph), because it is built together with the graph.
+The OpenStreetMap street network is downloaded by scripts/00_download_osm.py
+and loaded in Phase 2 (street_graph.load_osm_walk_graph). Bars and pubs come
+from the same script (--venues) and are cleaned here.
 """
 
 from __future__ import annotations
@@ -88,6 +89,8 @@ class CleaningReport:
     notes: dict[str, int] = field(default_factory=dict)    # useful counts, nothing dropped
 
     def __str__(self) -> str:
+        """Readable summary for printing: rows in -> out, then one line per
+        drop reason and per note."""
         lines = [f"== {self.name}: {self.rows_in:,} rows in -> {self.rows_out:,} rows out"]
         for reason, n in self.dropped.items():
             lines.append(f"   dropped {n:>8,}  {reason}")
@@ -123,6 +126,11 @@ def _find_raw_file(path: Path, pattern: str) -> Path:
 
 
 def _check_columns(table: pd.DataFrame, needed: list[str], name: str) -> None:
+    """Stop with a clear error if any column in `needed` is missing from `table`.
+
+    Catches a changed download format right away, instead of a confusing
+    error later. `name` is used in the message, e.g. "Crime file".
+    """
     missing = [c for c in needed if c not in table.columns]
     if missing:
         raise ValueError(f"{name} is missing columns {missing}. Has the download format changed?")
@@ -137,6 +145,11 @@ def _drop(table: pd.DataFrame, remove: pd.Series, reason: str, dropped: dict[str
 
 
 def _outside_ottawa(x: pd.Series, y: pd.Series) -> pd.Series:
+    """True for every point outside config.OTTAWA_BOUNDS_M.
+
+    x and y must already be in config.CRS_METRES. Used to drop location errors
+    (e.g. a light recorded near the equator).
+    """
     min_x, min_y, max_x, max_y = config.OTTAWA_BOUNDS_M
     return ~(x.between(min_x, max_x) & y.between(min_y, max_y))
 

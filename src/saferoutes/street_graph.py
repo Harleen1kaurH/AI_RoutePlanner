@@ -2,7 +2,10 @@
 
 Owner: Data person
 
-No machine learning here. Output files:
+No machine learning here. Inputs: config.RAW_OSM_GRAPH (from scripts/00_download_osm.py),
+        config.CRIME_CLEAN, config.LIGHTS_CLEAN, config.CALLS_CLEAN (Phase 1)
+
+Output files:
     config.STREET_GRAPH, config.CRIME_SNAPPED, config.CRIME_COUNTS_MONTHLY,
     config.CALL_COUNTS_MONTHLY
 
@@ -25,35 +28,43 @@ from saferoutes import config
 # ---------------------------------------------------------------------------
 # Graph
 # ---------------------------------------------------------------------------
-def download_walk_graph(place: str = config.STUDY_AREA) -> nx.MultiDiGraph:
-    """Download the walking network with OSMnx and project it to config.CRS_METRES.
+def load_osm_walk_graph(path: Path = config.RAW_OSM_GRAPH) -> nx.MultiDiGraph:
+    """Load the walking network saved by scripts/00_download_osm.py and
+    convert it to config.CRS_METRES.
 
     Nodes = intersections (with x, y in metres). Edges = street segments
-    (with length in metres and OSM tags such as "highway").
+    (with length in metres and OSM tags such as "highway", "tunnel", "footway").
+    Raises FileNotFoundError with a hint to run 00_download_osm.py if missing.
     """
     raise NotImplementedError
 
 
 def restrict_to_urban_area(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
-    """Keep only urban Ottawa (e.g. inside the Greenbelt) and the largest
-    connected part of the network."""
+    """Keep only urban Ottawa and the largest connected part of the network.
+
+    The download box also covers part of Gatineau (Quebec), north of the
+    Ottawa River. Our crime data covers Ottawa only, so Gatineau streets would
+    look crime-free: remove them. Then keep the largest connected piece so every
+    start can reach every end.
+    """
     raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
 # Crime -> intersections
 # ---------------------------------------------------------------------------
-def snap_crimes_to_nodes(
-    crime: gpd.GeoDataFrame,
+def snap_to_nodes(
+    points: gpd.GeoDataFrame,
     G: nx.MultiDiGraph,
     max_distance_m: float = config.SNAP_MAX_DISTANCE_M,
 ) -> tuple[gpd.GeoDataFrame, int]:
-    """Attach each crime to its nearest intersection.
+    """Attach each point (a crime or a call for service) to its nearest intersection.
 
-    Adds columns node_id and snap_distance_m. Crimes farther than
-    max_distance_m are dropped.
+    Adds columns node_id and snap_distance_m. Points farther than
+    max_distance_m from every intersection are dropped (e.g. outside the
+    study area, or on a highway).
 
-    Returns (snapped crimes, number of crimes dropped).
+    Returns (snapped points, number of points dropped).
     """
     raise NotImplementedError
 
