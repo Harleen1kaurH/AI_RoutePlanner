@@ -80,6 +80,12 @@ def add_light_features(
 
     darkness = 1 - lights_per_100m / config.DARK_THRESHOLD_LIGHTS_PER_100M,
     clipped to [0, 1].
+
+    IMPORTANT: count each light POSITION once, not each record. Round positions
+    to config.LIGHT_POSITION_ROUND_M and drop repeats first, so a pole with two
+    records (two fixtures, a copied record, or a replaced light that was never
+    removed) counts as one lit spot. Twin-arm poles are slightly undercounted;
+    mention this in the report's limitations.
     """
     raise NotImplementedError
 
