@@ -3,11 +3,16 @@
 Owner: Data person
 
 Output files (see config.py for the exact columns):
-    config.CRIME_CLEAN, config.LIGHTS_CLEAN
+    config.CRIME_CLEAN, config.LIGHTS_CLEAN, config.STOPS_CLEAN,
+    config.CALLS_CLEAN, config.VENUES_CLEAN, config.CLEANING_REPORT
+
+The OpenStreetMap street network is loaded in Phase 2
+(street_graph.download_walk_graph), because it is built together with the graph.
 """
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,6 +20,58 @@ import geopandas as gpd
 import pandas as pd
 
 from saferoutes import config
+
+# Raw crime column -> our column name. Only these columns are kept.
+RAW_CRIME_COLUMNS: dict[str, str] = {
+    "OBJECTID": "offence_id",
+    "Occurred Date": "occurred_date",
+    "Occurred Hour": "occurred_hour",
+    "Reported Date": "reported_date",
+    "Offence Summary": "offence_summary",
+    "Offence Category": "offence_category",
+    "Neighbourhood Name": "neighbourhood",
+    "Intersection": "intersection",
+    "x": "x",
+    "y": "y",
+}
+
+# Raw street-light column -> our column name.
+RAW_LIGHT_COLUMNS: dict[str, str] = {
+    "OBJECTID": "light_id",
+    "LIGHT_TYPE": "light_type",
+    "LIGHTS_NUM": "n_heads",
+    "WATTAGE": "wattage",
+    "X": "x",
+    "Y": "y",
+}
+
+# Raw bus-stop column -> our column name.
+RAW_STOP_COLUMNS: dict[str, str] = {
+    "FID": "stop_id",
+    "F560": "stop_code",      # the number shown at the stop; "0" = no code
+    "Location": "stop_name",  # e.g. "SUSSEX / RIDEAU FALLS"
+    "Shelter": "shelter",     # "Y" or blank
+    "Bench": "bench",         # "Y" or blank
+    "Latitude": "lat",
+    "Longitude": "lon",
+}
+
+# Raw calls-for-service column -> our column name.
+RAW_CALL_COLUMNS: dict[str, str] = {
+    "OBJECTID": "call_id",
+    "Received Date": "received_date",
+    "Received Hour": "received_hour",
+    "Priority": "priority",           # 1 (most urgent) to 7
+    "Initiated By": "initiated_by",   # C = citizen called, O = officer started it
+    "Neighbourhood": "neighbourhood",
+    "Intersection": "intersection",
+    "x": "x",
+    "y": "y",
+}
+
+# A crime reported this many days after it happened counts as "reported late"
+# (a note for the report, not a reason to drop it).
+LATE_REPORT_DAYS: int = 90
 
 
 @dataclass
@@ -27,7 +84,70 @@ class CleaningReport:
     name: str
     rows_in: int
     rows_out: int
-    dropped: dict[str, int] = field(default_factory=dict)  # reason -> count
+    dropped: dict[str, int] = field(default_factory=dict)  # reason -> rows dropped
+    notes: dict[str, int] = field(default_factory=dict)    # useful counts, nothing dropped
+
+    def __str__(self) -> str:
+        lines = [f"== {self.name}: {self.rows_in:,} rows in -> {self.rows_out:,} rows out"]
+        for reason, n in self.dropped.items():
+            lines.append(f"   dropped {n:>8,}  {reason}")
+        for label, n in self.notes.items():
+            lines.append(f"   note    {n:>8,}  {label}")
+        return "\n".join(lines)
+
+    def to_frame(self) -> pd.DataFrame:
+        """One row per item, for saving to CSV."""
+        rows = [{"dataset": self.name, "kind": "rows_in", "item": "", "count": self.rows_in}]
+        rows += [{"dataset": self.name, "kind": "dropped", "item": k, "count": v} for k, v in self.dropped.items()]
+        rows += [{"dataset": self.name, "kind": "note", "item": k, "count": v} for k, v in self.notes.items()]
+        rows.append({"dataset": self.name, "kind": "rows_out", "item": "", "count": self.rows_out})
+        return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _find_raw_file(path: Path, pattern: str) -> Path:
+    """Return `path` if it exists, otherwise the single file in the same folder
+    matching `pattern` (downloads often add a number to the file name)."""
+    if path.exists():
+        return path
+    matches = sorted(path.parent.glob(pattern))
+    if len(matches) == 1:
+        return matches[0]
+    raise FileNotFoundError(
+        f"Could not find {path.name} in {path.parent}. "
+        f"Download it and save it there (see data/README.md). "
+        f"Files matching '{pattern}': {[m.name for m in matches]}"
+    )
+
+
+def _check_columns(table: pd.DataFrame, needed: list[str], name: str) -> None:
+    missing = [c for c in needed if c not in table.columns]
+    if missing:
+        raise ValueError(f"{name} is missing columns {missing}. Has the download format changed?")
+
+
+def _drop(table: pd.DataFrame, remove: pd.Series, reason: str, dropped: dict[str, int]) -> pd.DataFrame:
+    """Drop rows where `remove` is True and record how many under `reason`."""
+    n = int(remove.sum())
+    if n:
+        dropped[reason] = n
+    return table.loc[~remove]
+
+
+def _outside_ottawa(x: pd.Series, y: pd.Series) -> pd.Series:
+    min_x, min_y, max_x, max_y = config.OTTAWA_BOUNDS_M
+    return ~(x.between(min_x, max_x) & y.between(min_y, max_y))
+
+
+def _parse_day(text: pd.Series) -> pd.Series:
+    """'1/24/2018 5:00:00 AM' -> 2018-01-24.
+
+    The time part is always 5:00 AM (a time-zone artifact), so only the
+    date is kept. The real hour comes from the "Occurred Hour" column.
+    """
+    return pd.to_datetime(text.str.split(" ").str[0], format="%m/%d/%Y", errors="coerce")
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +155,10 @@ class CleaningReport:
 # ---------------------------------------------------------------------------
 def load_raw_crime(path: Path = config.RAW_CRIME) -> pd.DataFrame:
     """Read the Ottawa Police criminal offences CSV exactly as downloaded."""
-    raise NotImplementedError
+    path = _find_raw_file(path, "Criminal_Offences_Open_Data*.csv")
+    raw = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+    _check_columns(raw, list(RAW_CRIME_COLUMNS), "Crime file")
+    return raw
 
 
 def clean_crime(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
@@ -51,7 +174,62 @@ def clean_crime(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
 
     Returns the clean table (columns listed at config.CRIME_CLEAN) and a report.
     """
-    raise NotImplementedError
+    _check_columns(raw, list(RAW_CRIME_COLUMNS), "Crime file")
+    rows_in = len(raw)
+    dropped: dict[str, int] = {}
+
+    df = raw[list(RAW_CRIME_COLUMNS)].rename(columns=RAW_CRIME_COLUMNS)
+
+    # 1. Dates: occurred date is the one we use
+    df["occurred_date"] = _parse_day(df["occurred_date"].astype(str))
+    df["reported_date"] = _parse_day(df["reported_date"].astype(str))
+    df = _drop(df, df["occurred_date"].isna(), "occurred date missing or unreadable", dropped)
+
+    start, end = pd.Timestamp(config.DATA_START), pd.Timestamp(config.DATA_END)
+    df = _drop(df, df["occurred_date"] < start,
+               f"occurred before {config.DATA_START} (outside dataset coverage)", dropped)
+    df = _drop(df, df["occurred_date"] > end, f"occurred after {config.DATA_END}", dropped)
+
+    # 2. Hour: stored as 0, 100, ..., 2300
+    hour_raw = pd.to_numeric(df["occurred_hour"], errors="coerce")
+    bad_hour = hour_raw.isna() | (hour_raw % 100 != 0) | ~hour_raw.between(0, 2300)
+    df = _drop(df, bad_hour, "occurred hour missing or not a whole hour", dropped)
+    df["hour"] = (pd.to_numeric(df["occurred_hour"]) // 100).astype(int)
+
+    # 3. Location
+    df = _drop(df, df["x"].isna() | df["y"].isna(), "no location (x/y missing)", dropped)
+    df = _drop(df, _outside_ottawa(df["x"], df["y"]), "location outside Ottawa", dropped)
+
+    # 4. Flags
+    df["offence_group"] = df["offence_category"].map(config.OFFENCE_GROUPS).fillna("other")
+    df["is_person"] = df["offence_summary"].str.startswith(config.PERSON_CRIME_PREFIX, na=False)
+    df["hour_unknown"] = df["hour"] == config.UNKNOWN_HOUR
+    df["is_night"] = df["hour"].isin(config.NIGHT_HOURS) & ~df["hour_unknown"]
+
+    # 5. Geometry in metres (crime x/y are already MTM zone 9; to_crs is a
+    #    safety net in case config.CRS_METRES is ever changed)
+    clean = gpd.GeoDataFrame(
+        df.drop(columns=["occurred_hour", "x", "y"]),
+        geometry=gpd.points_from_xy(df["x"], df["y"]),
+        crs=config.CRS_CRIME_RAW,
+    ).to_crs(config.CRS_METRES)
+
+    columns = ["offence_id", "occurred_date", "reported_date", "hour", "offence_summary",
+               "offence_category", "offence_group", "is_person", "is_night", "hour_unknown",
+               "neighbourhood", "intersection", "geometry"]
+    clean = clean[columns].reset_index(drop=True)
+
+    delay_days = (clean["reported_date"] - clean["occurred_date"]).dt.days
+    notes = {
+        "crimes against the person": int(clean["is_person"].sum()),
+        "night-time crimes against the person (the label)": int((clean["is_person"] & clean["is_night"]).sum()),
+        "hour 0, treated as time unknown (kept, never night)": int(clean["hour_unknown"].sum()),
+        f"reported more than {LATE_REPORT_DAYS} days after occurring": int((delay_days > LATE_REPORT_DAYS).sum()),
+        "no intersection name (location still present)": int(clean["intersection"].isna().sum()),
+    }
+    report = CleaningReport("crime", rows_in, len(clean), dropped, notes)
+    assert report.rows_in - sum(dropped.values()) == report.rows_out
+    return clean, report
 
 
 # ---------------------------------------------------------------------------
@@ -59,35 +237,243 @@ def clean_crime(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
 # ---------------------------------------------------------------------------
 def load_raw_lights(path: Path = config.RAW_LIGHTS) -> pd.DataFrame:
     """Read the City of Ottawa street lights CSV exactly as downloaded."""
-    raise NotImplementedError
+    path = _find_raw_file(path, "Street_Lights*.csv")
+    raw = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+    _check_columns(raw, list(RAW_LIGHT_COLUMNS), "Street lights file")
+    return raw
 
 
 def clean_lights(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
     """Drop lights with no location and convert from config.CRS_LIGHTS_RAW
     to config.CRS_METRES.
 
-    Returns columns: light_id, light_type, geometry.
+    Returns columns: light_id, light_type, n_heads, wattage, geometry.
+    Several records can share one position (one pole, several fixtures);
+    they are kept and counted in the notes.
     """
-    raise NotImplementedError
+    _check_columns(raw, list(RAW_LIGHT_COLUMNS), "Street lights file")
+    rows_in = len(raw)
+    dropped: dict[str, int] = {}
+
+    df = raw[list(RAW_LIGHT_COLUMNS)].rename(columns=RAW_LIGHT_COLUMNS)
+    df = _drop(df, df["x"].isna() | df["y"].isna(), "no location (X/Y missing)", dropped)
+
+    lights = gpd.GeoDataFrame(
+        df.drop(columns=["x", "y"]),
+        geometry=gpd.points_from_xy(df["x"], df["y"]),
+        crs=config.CRS_LIGHTS_RAW,
+    ).to_crs(config.CRS_METRES)
+
+    outside = _outside_ottawa(lights.geometry.x, lights.geometry.y)
+    lights = _drop(lights, outside, "location outside Ottawa", dropped)
+
+    lights["n_heads"] = pd.to_numeric(lights["n_heads"], errors="coerce").fillna(1).astype(int)
+    lights["wattage"] = pd.to_numeric(lights["wattage"], errors="coerce").fillna(0).astype(int)
+    lights = lights[["light_id", "light_type", "n_heads", "wattage", "geometry"]].reset_index(drop=True)
+
+    xy = pd.DataFrame({"x": lights.geometry.x.round(1), "y": lights.geometry.y.round(1)})
+    notes = {"records sharing a position with another record (kept)": int(xy.duplicated().sum())}
+    report = CleaningReport("street lights", rows_in, len(lights), dropped, notes)
+    assert report.rows_in - sum(dropped.values()) == report.rows_out
+    return lights, report
 
 
 # ---------------------------------------------------------------------------
-# Optional sources (only if time allows)
+# Bus stops
 # ---------------------------------------------------------------------------
-def load_transit_stops(gtfs_dir: Path = config.RAW_GTFS_DIR) -> gpd.GeoDataFrame:
-    """OPTIONAL. OC Transpo stops with the number of trips after 10 pm.
+def load_raw_stops(path: Path = config.RAW_TRANSIT_STOPS) -> pd.DataFrame:
+    """Read the OC Transpo stops CSV exactly as downloaded.
 
-    Returns columns: stop_id, night_trips_per_hour, geometry.
+    Stop codes (column F560) are read as text, so codes like "0123" keep their zero.
     """
-    raise NotImplementedError
+    path = _find_raw_file(path, "OC_Transpo_Stops*.csv")
+    raw = pd.read_csv(path, encoding="utf-8-sig", dtype={"F560": str})
+    _check_columns(raw, list(RAW_STOP_COLUMNS), "Bus stops file")
+    return raw
 
 
-def load_licensed_venues(path: Path = config.RAW_VENUES) -> gpd.GeoDataFrame:
-    """OPTIONAL. AGCO liquor licences, geocoded to points.
+def clean_stops(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+    """Clean the OC Transpo stops table.
 
-    Returns columns: venue_id, licence_type, geometry.
+    Steps:
+        - stop code "0" means "no code", so it becomes missing
+        - Shelter / Bench are "Y" or blank -> has_shelter / has_bench (True/False)
+        - drop rows with no latitude/longitude
+        - convert from latitude/longitude (config.CRS_STOPS_RAW) to config.CRS_METRES
+        - drop stops outside the Ottawa box
+
+    The file has stop locations only, no timetable, so it can't say how many
+    buses stop at night. That needs the OC Transpo GTFS timetable (future work).
+
+    Returns columns: stop_id, stop_code, stop_name, has_shelter, has_bench, geometry.
     """
-    raise NotImplementedError
+    _check_columns(raw, list(RAW_STOP_COLUMNS), "Bus stops file")
+    rows_in = len(raw)
+    dropped: dict[str, int] = {}
+
+    df = raw[list(RAW_STOP_COLUMNS)].rename(columns=RAW_STOP_COLUMNS)
+    df = _drop(df, df["lat"].isna() | df["lon"].isna(), "no location (Latitude/Longitude missing)", dropped)
+
+    df["stop_code"] = df["stop_code"].astype("string").str.strip()
+    df.loc[df["stop_code"].isin(["", "0"]), "stop_code"] = pd.NA
+    df["stop_name"] = df["stop_name"].astype("string").str.strip()
+    df["has_shelter"] = df["shelter"].astype("string").str.strip().str.upper().eq("Y").fillna(False).astype(bool)
+    df["has_bench"] = df["bench"].astype("string").str.strip().str.upper().eq("Y").fillna(False).astype(bool)
+
+    stops = gpd.GeoDataFrame(
+        df.drop(columns=["lat", "lon", "shelter", "bench"]),
+        geometry=gpd.points_from_xy(df["lon"], df["lat"]),   # x = longitude, y = latitude
+        crs=config.CRS_STOPS_RAW,
+    ).to_crs(config.CRS_METRES)
+
+    outside = _outside_ottawa(stops.geometry.x, stops.geometry.y)
+    stops = _drop(stops, outside, "location outside Ottawa", dropped)
+
+    stops = stops[["stop_id", "stop_code", "stop_name", "has_shelter", "has_bench", "geometry"]]
+    stops = stops.reset_index(drop=True)
+
+    codes = stops["stop_code"].dropna()
+    notes = {
+        "stops with a shelter": int(stops["has_shelter"].sum()),
+        "stops with a bench": int(stops["has_bench"].sum()),
+        "stops with no stop code (kept)": int(stops["stop_code"].isna().sum()),
+        "stops sharing a stop code with another stop (kept)": int(codes.duplicated(keep=False).sum()),
+    }
+    report = CleaningReport("bus stops", rows_in, len(stops), dropped, notes)
+    assert report.rows_in - sum(dropped.values()) == report.rows_out
+    return stops, report
+
+
+# ---------------------------------------------------------------------------
+# Calls for service
+# ---------------------------------------------------------------------------
+def load_raw_calls(path: Path = config.RAW_CALLS) -> pd.DataFrame:
+    """Read the Ottawa Police dispatched calls for service CSV as downloaded
+    (about 1.1 million rows, 2021-2025)."""
+    path = _find_raw_file(path, "Calls_For_Service*.csv")
+    raw = pd.read_csv(path, encoding="utf-8-sig", usecols=list(RAW_CALL_COLUMNS), low_memory=False)
+    _check_columns(raw, list(RAW_CALL_COLUMNS), "Calls for service file")
+    return raw
+
+
+def clean_calls(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+    """Clean the calls for service table.
+
+    Calls have NO call type (we can't tell a fight from a noise complaint),
+    so they're used as features about how often police are needed somewhere,
+    never as the label.
+
+    Steps:
+        - "Received Date" -> received_date (date part only; the time is always 5:00 AM)
+        - "Received Hour" (e.g. 2200) -> hour (0-23). Hour 0 is real midnight
+          here, so is_night uses config.CALLS_NIGHT_HOURS (includes 0)
+        - Initiated By "C" -> "citizen", "O" -> "officer"
+        - is_urgent = priority <= config.URGENT_PRIORITY_MAX
+        - drop rows with no x/y; convert from Web Mercator to config.CRS_METRES
+
+    Returns columns listed at config.CALLS_CLEAN, and a report.
+    """
+    _check_columns(raw, list(RAW_CALL_COLUMNS), "Calls for service file")
+    rows_in = len(raw)
+    dropped: dict[str, int] = {}
+
+    df = raw[list(RAW_CALL_COLUMNS)].rename(columns=RAW_CALL_COLUMNS)
+
+    # 1. Date
+    df["received_date"] = _parse_day(df["received_date"].astype(str))
+    df = _drop(df, df["received_date"].isna(), "received date missing or unreadable", dropped)
+    start, end = pd.Timestamp(config.DATA_START), pd.Timestamp(config.DATA_END)
+    df = _drop(df, (df["received_date"] < start) | (df["received_date"] > end),
+               f"received outside {config.DATA_START} to {config.DATA_END}", dropped)
+
+    # 2. Hour
+    hour_raw = pd.to_numeric(df["received_hour"], errors="coerce")
+    bad_hour = hour_raw.isna() | (hour_raw % 100 != 0) | ~hour_raw.between(0, 2300)
+    df = _drop(df, bad_hour, "received hour missing or not a whole hour", dropped)
+    df["hour"] = (pd.to_numeric(df["received_hour"]) // 100).astype(int)
+
+    # 3. Priority and who started the call
+    df["priority"] = pd.to_numeric(df["priority"], errors="coerce")
+    df = _drop(df, ~df["priority"].between(1, 7), "priority missing or not 1-7", dropped)
+    df["priority"] = df["priority"].astype(int)
+    who = df["initiated_by"].astype("string").str.strip().str.upper().map({"C": "citizen", "O": "officer"})
+    df = _drop(df, who.isna(), "initiated by missing or not C/O", dropped)
+    df["initiated_by"] = who.loc[df.index].astype(str)
+
+    # 4. Location
+    df = _drop(df, df["x"].isna() | df["y"].isna(), "no location (x/y missing)", dropped)
+    calls = gpd.GeoDataFrame(
+        df.drop(columns=["received_hour", "x", "y"]),
+        geometry=gpd.points_from_xy(df["x"], df["y"]),
+        crs=config.CRS_CALLS_RAW,
+    ).to_crs(config.CRS_METRES)
+    calls = _drop(calls, _outside_ottawa(calls.geometry.x, calls.geometry.y), "location outside Ottawa", dropped)
+
+    # 5. Flags
+    calls["is_night"] = calls["hour"].isin(config.CALLS_NIGHT_HOURS)
+    calls["is_urgent"] = calls["priority"] <= config.URGENT_PRIORITY_MAX
+
+    columns = ["call_id", "received_date", "hour", "priority", "initiated_by", "is_night",
+               "is_urgent", "neighbourhood", "intersection", "geometry"]
+    calls = calls[columns].reset_index(drop=True)
+
+    night = calls["is_night"]
+    notes = {
+        "started by a citizen": int((calls["initiated_by"] == "citizen").sum()),
+        "started by an officer": int((calls["initiated_by"] == "officer").sum()),
+        "night-time calls started by a citizen": int((night & (calls["initiated_by"] == "citizen")).sum()),
+        "night-time urgent calls (priority 1-2)": int((night & calls["is_urgent"]).sum()),
+        "no intersection name (location still present)": int(calls["intersection"].isna().sum()),
+    }
+    report = CleaningReport("calls for service", rows_in, len(calls), dropped, notes)
+    assert report.rows_in - sum(dropped.values()) == report.rows_out
+    return calls, report
+
+
+# ---------------------------------------------------------------------------
+# Bars and pubs (from OpenStreetMap)
+# ---------------------------------------------------------------------------
+def load_raw_venues(path: Path = config.RAW_OSM_VENUES) -> gpd.GeoDataFrame:
+    """Read the bars/pubs file made by `python scripts/00_download_osm.py --venues`."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path.name} not found in {path.parent}. "
+            "Run: python scripts/00_download_osm.py --venues   (needs internet)"
+        )
+    raw = gpd.read_parquet(path)
+    _check_columns(raw, ["venue_id", "kind", "name", "opening_hours", "geometry"], "Venues file")
+    return raw
+
+
+def clean_venues(raw: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+    """Clean the bars, pubs and nightclubs from OpenStreetMap.
+
+    Steps:
+        - drop venues with no location
+        - drop exact repeats of the same OpenStreetMap feature
+        - convert to config.CRS_METRES and drop venues outside Ottawa
+
+    opening_hours is kept as OpenStreetMap writes it (e.g. "Mo-Su 11:00-02:00"),
+    often missing; it isn't parsed yet.
+
+    Returns columns: venue_id, kind, name, opening_hours, geometry.
+    """
+    rows_in = len(raw)
+    dropped: dict[str, int] = {}
+
+    venues = raw[["venue_id", "kind", "name", "opening_hours", "geometry"]].copy()
+    venues = _drop(venues, venues.geometry.isna() | venues.geometry.is_empty, "no location", dropped)
+    venues = _drop(venues, venues["venue_id"].duplicated(), "same OpenStreetMap feature listed twice", dropped)
+
+    venues = venues.to_crs(config.CRS_METRES)
+    venues = _drop(venues, _outside_ottawa(venues.geometry.x, venues.geometry.y), "location outside Ottawa", dropped)
+    venues = gpd.GeoDataFrame(venues.reset_index(drop=True), geometry="geometry", crs=config.CRS_METRES)
+
+    notes = {f"kind = {k}": int(n) for k, n in venues["kind"].value_counts().items()}
+    notes["with opening hours"] = int(venues["opening_hours"].notna().sum())
+    report = CleaningReport("bars and pubs", rows_in, len(venues), dropped, notes)
+    assert report.rows_in - sum(dropped.values()) == report.rows_out
+    return venues, report
 
 
 # ---------------------------------------------------------------------------
@@ -95,12 +481,46 @@ def load_licensed_venues(path: Path = config.RAW_VENUES) -> gpd.GeoDataFrame:
 # ---------------------------------------------------------------------------
 def save_parquet(table: pd.DataFrame | gpd.GeoDataFrame, path: Path) -> None:
     """Save a table as Parquet, creating the folder if needed."""
-    raise NotImplementedError
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table.to_parquet(path, index=False)
+
+
+def save_reports(reports: list[CleaningReport], path: Path = config.CLEANING_REPORT) -> None:
+    """Save all cleaning reports to one CSV (for the report's Dataset section)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.concat([r.to_frame() for r in reports], ignore_index=True).to_csv(path, index=False)
 
 
 def run() -> list[CleaningReport]:
-    """Run all of Phase 1: load, clean and save crime and lights.
+    """Run all of Phase 1: load, clean and save every dataset.
+
+    Crime and street lights are required. Bus stops, calls for service and
+    bars/pubs are skipped with a warning if their raw file is missing, so a
+    teammate without them can still run the rest.
 
     Returns the cleaning reports so the script can print them.
     """
-    raise NotImplementedError
+    crime, crime_report = clean_crime(load_raw_crime())
+    save_parquet(crime, config.CRIME_CLEAN)
+
+    lights, lights_report = clean_lights(load_raw_lights())
+    save_parquet(lights, config.LIGHTS_CLEAN)
+    reports = [crime_report, lights_report]
+
+    optional = [
+        ("bus stops", load_raw_stops, clean_stops, config.STOPS_CLEAN),
+        ("calls for service", load_raw_calls, clean_calls, config.CALLS_CLEAN),
+        ("bars and pubs", load_raw_venues, clean_venues, config.VENUES_CLEAN),
+    ]
+    for name, load, clean, out_path in optional:
+        try:
+            raw = load()
+        except FileNotFoundError as error:
+            warnings.warn(f"Skipping {name}: {error}", stacklevel=2)
+            continue
+        table, report = clean(raw)
+        save_parquet(table, out_path)
+        reports.append(report)
+
+    save_reports(reports)
+    return reports

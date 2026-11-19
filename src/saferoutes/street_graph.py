@@ -3,7 +3,8 @@
 Owner: Data person
 
 No machine learning here. Output files:
-    config.STREET_GRAPH, config.CRIME_SNAPPED, config.CRIME_COUNTS_MONTHLY
+    config.STREET_GRAPH, config.CRIME_SNAPPED, config.CRIME_COUNTS_MONTHLY,
+    config.CALL_COUNTS_MONTHLY
 
 Every edge must end up with the attributes listed in config.EDGE_ATTRIBUTES
 (except model_risk_score, which routing.attach_model_risk adds later).
@@ -68,6 +69,18 @@ def monthly_crime_counts(crime_snapped: gpd.GeoDataFrame) -> pd.DataFrame:
     raise NotImplementedError
 
 
+def monthly_call_counts(calls_snapped: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Count calls for service per intersection per month (snap calls to
+    intersections first, exactly like crimes).
+
+    Returns columns: node_id, month (first day of month),
+    n_calls_night_citizen, n_calls_night_urgent, n_calls_all.
+    Officer-started calls are left out of the night counts: they mostly show
+    where police patrol, not where trouble is.
+    """
+    raise NotImplementedError
+
+
 # ---------------------------------------------------------------------------
 # Safety numbers on edges (each function edits G in place)
 # ---------------------------------------------------------------------------
@@ -80,6 +93,12 @@ def add_light_features(
 
     darkness = 1 - lights_per_100m / config.DARK_THRESHOLD_LIGHTS_PER_100M,
     clipped to [0, 1].
+
+    IMPORTANT: count each light POSITION once, not each record. Round positions
+    to config.LIGHT_POSITION_ROUND_M and drop repeats first, so a pole with two
+    records (two fixtures, a copied record, or a replaced light that was never
+    removed) counts as one lit spot. Twin-arm poles are slightly undercounted;
+    mention this in the report's limitations.
     """
     raise NotImplementedError
 

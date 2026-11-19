@@ -22,8 +22,12 @@ RESULTS: Path = ROOT / "results"
 # ---------------------------------------------------------------------------
 RAW_CRIME: Path = DATA_RAW / "Criminal_Offences_Open_Data.csv"
 RAW_LIGHTS: Path = DATA_RAW / "Street_Lights.csv"
-RAW_GTFS_DIR: Path = DATA_RAW / "gtfs"                    # optional
-RAW_VENUES: Path = DATA_RAW / "agco_liquor_licences.csv"  # optional
+RAW_OSM_GRAPH: Path = DATA_RAW / "osm_walk_raw.graphml"    # made by scripts/00_download_osm.py
+RAW_OSM_AREAS: Path = DATA_RAW / "osm_areas.parquet"       # optional, same script
+RAW_TRANSIT_STOPS: Path = DATA_RAW / "OC_Transpo_Stops.csv"
+RAW_CALLS: Path = DATA_RAW / "Calls_For_Service.csv"       # download adds a number; any Calls_For_Service*.csv is found
+RAW_OSM_VENUES: Path = DATA_RAW / "osm_venues.parquet"     # made by scripts/00_download_osm.py --venues
+RAW_GTFS_DIR: Path = DATA_RAW / "gtfs"                    # optional, future: buses per hour at night
 
 # ---------------------------------------------------------------------------
 # Shared hand-off files (the "contracts" between team members)
@@ -31,11 +35,27 @@ RAW_VENUES: Path = DATA_RAW / "agco_liquor_licences.csv"  # optional
 # ---------------------------------------------------------------------------
 # Phase 1 -> everyone
 CRIME_CLEAN: Path = DATA_PROCESSED / "crime_clean.parquet"
-#   occurred_date (datetime), hour (int 0-23), offence_summary (str),
-#   offence_category (str), is_person (bool), is_night (bool),
-#   hour_unknown (bool), geometry (Point, CRS_METRES)
+#   offence_id (int), occurred_date (datetime), reported_date (datetime),
+#   hour (int 0-23), offence_summary (str), offence_category (str),
+#   offence_group (str, see OFFENCE_GROUPS), is_person (bool), is_night (bool),
+#   hour_unknown (bool), neighbourhood (str), intersection (str),
+#   geometry (Point, CRS_METRES)
 LIGHTS_CLEAN: Path = DATA_PROCESSED / "lights_clean.parquet"
-#   light_id (int), light_type (str), geometry (Point, CRS_METRES)
+#   light_id (int), light_type (str), n_heads (int), wattage (int),
+#   geometry (Point, CRS_METRES)
+STOPS_CLEAN: Path = DATA_PROCESSED / "stops_clean.parquet"
+#   stop_id (int), stop_code (str or missing), stop_name (str),
+#   has_shelter (bool), has_bench (bool), geometry (Point, CRS_METRES)
+CALLS_CLEAN: Path = DATA_PROCESSED / "calls_clean.parquet"
+#   call_id (int), received_date (datetime), hour (int 0-23), priority (int 1-7),
+#   initiated_by ("citizen" / "officer"), is_night (bool), is_urgent (bool),
+#   neighbourhood (str), intersection (str), geometry (Point, CRS_METRES)
+VENUES_CLEAN: Path = DATA_PROCESSED / "venues_clean.parquet"
+#   venue_id (str, e.g. "node/123"), kind ("bar", "pub", "nightclub", ...),
+#   name (str or missing), opening_hours (str or missing),
+#   geometry (Point, CRS_METRES)
+CLEANING_REPORT: Path = RESULTS / "cleaning_report.csv"
+#   one row per (dataset, item): rows in/out, rows dropped per reason, notes
 
 # Phase 2 -> ML, routing, evaluation
 CRIME_SNAPPED: Path = DATA_PROCESSED / "crime_snapped.parquet"
@@ -43,6 +63,9 @@ CRIME_SNAPPED: Path = DATA_PROCESSED / "crime_snapped.parquet"
 CRIME_COUNTS_MONTHLY: Path = DATA_PROCESSED / "crime_counts_monthly.parquet"
 #   node_id (int), month (datetime, first day of month),
 #   n_person_night, n_all, n_property, n_mischief, n_theft (int)
+CALL_COUNTS_MONTHLY: Path = DATA_PROCESSED / "call_counts_monthly.parquet"
+#   node_id (int), month (datetime, first day of month),
+#   n_calls_night_citizen, n_calls_night_urgent, n_calls_all (int)
 STREET_GRAPH: Path = DATA_PROCESSED / "street_graph.graphml"
 #   edge attributes: see EDGE_ATTRIBUTES below
 
@@ -74,6 +97,8 @@ EDGE_ATTRIBUTES: tuple[str, ...] = (
 CRS_METRES: str = "EPSG:2951"   # MTM zone 9 (metres). Everything is converted to this.
 CRS_CRIME_RAW: str = "EPSG:2951"
 CRS_LIGHTS_RAW: str = "EPSG:3857"  # Web Mercator
+CRS_STOPS_RAW: str = "EPSG:4326"   # bus stops: Latitude / Longitude columns
+CRS_CALLS_RAW: str = "EPSG:3857"   # calls for service: x / y in Web Mercator (like the lights)
 CRS_LATLON: str = "EPSG:4326"
 
 # ---------------------------------------------------------------------------
@@ -82,12 +107,72 @@ CRS_LATLON: str = "EPSG:4326"
 STUDY_AREA: str = "Ottawa, Ontario, Canada"   # narrowed to urban Ottawa in Phase 2
 DEMO_AREA: tuple[str, ...] = ("Centretown", "Byward Market", "Lowertown")
 
+# OpenStreetMap download area: (west, south, east, north) in longitude/latitude.
+# Default = urban Ottawa inside the Greenbelt (downtown + inner suburbs;
+# Kanata, Barrhaven and Orleans are NOT included). Change here if the team
+# picks a different study area, then re-run scripts/00_download_osm.py.
+OSM_BBOX_LATLON: tuple[float, float, float, float] = (-75.85, 45.33, -75.58, 45.47)
+
+# Extra street tags to keep (OSMnx keeps highway, tunnel, bridge, service, ... by default)
+OSM_EXTRA_WAY_TAGS: tuple[str, ...] = ("covered", "footway", "lit")
+
+# Area shapes for the optional isolation check (water, parks, parking, industrial)
+OSM_AREA_TAGS: dict[str, bool | str | list[str]] = {
+    "waterway": True,
+    "natural": "water",
+    "leisure": "park",
+    "amenity": "parking",
+    "landuse": "industrial",
+}
+
+# Bars and pubs (scripts/00_download_osm.py --venues)
+OSM_VENUE_TAGS: dict[str, bool | str | list[str]] = {
+    "amenity": ["bar", "pub", "nightclub", "biergarten"],
+}
+
+# Box around the City of Ottawa in CRS_METRES: (min_x, min_y, max_x, max_y).
+# Points outside it are location errors and are dropped.
+OTTAWA_BOUNDS_M: tuple[float, float, float, float] = (315_000.0, 4_979_000.0, 404_000.0, 5_046_000.0)
+
 # ---------------------------------------------------------------------------
 # Crime definitions
 # ---------------------------------------------------------------------------
+# The police file covers crimes REPORTED in 2018-2025. Some occurred much
+# earlier (back to 1948); those are dropped because years before 2018 are
+# incomplete.
+DATA_START: date = date(2018, 1, 1)
+DATA_END: date = date(2025, 12, 31)
+
 PERSON_CRIME_PREFIX: str = "Crimes Against The Person"
 NIGHT_HOURS: frozenset[int] = frozenset({18, 19, 20, 21, 22, 23, 1, 2, 3, 4, 5})
 UNKNOWN_HOUR: int = 0   # hour 0 looks like "time unknown"; never counted as night
+
+# Calls for service: hour 0 is REAL midnight here (counts fall smoothly
+# 11 pm -> midnight -> 1 am), unlike the crime file, so it counts as night.
+CALLS_NIGHT_HOURS: frozenset[int] = NIGHT_HOURS | {0}
+URGENT_PRIORITY_MAX: int = 2    # priority 1-2 = most urgent calls
+
+# Offence Category -> our group. Used for the activity features in Phase 3.
+# Anything not listed becomes "other".
+OFFENCE_GROUPS: dict[str, str] = {
+    # crimes against the person
+    "Assaults": "person",
+    "Attempting The Commission Of A Capital Crime": "person",
+    "Commodification Of Sexual Activity": "person",
+    "Other Violations Involving Violence Or The Threat Of Violence": "person",
+    "Sexual Violations": "person",
+    "Violations Causing Death": "person",
+    "Violations Resulting In The Deprivation Of Freedom": "person",
+    # property
+    "Theft $5000 and Under": "theft",
+    "Theft Over $5000": "theft",
+    "Theft - Motor Vehicle": "theft",
+    "Possession / Trafficking Stolen Goods": "theft",
+    "Mischief": "mischief",
+    "Arson": "mischief",
+    "Break and Enter": "break_and_enter",
+    "Fraud": "fraud",          # often recorded at a home or police station, not on the street
+}
 
 # ---------------------------------------------------------------------------
 # Distances (metres)
@@ -95,8 +180,16 @@ UNKNOWN_HOUR: int = 0   # hour 0 looks like "time unknown"; never counted as nig
 SNAP_MAX_DISTANCE_M: float = 30.0      # crime -> nearest intersection
 LIGHT_BUFFER_M: float = 25.0           # lights counted for a street
 LIGHTS_NEAR_NODE_M: float = 50.0       # lights counted for an intersection
+STOPS_NEAR_NODE_M: float = 200.0       # bus stops counted for an intersection
+VENUES_NEAR_NODE_M: float = 100.0      # bars and pubs counted for an intersection
 NEIGHBOUR_RADIUS_M: float = 250.0      # neighbouring intersections
 DARK_THRESHOLD_LIGHTS_PER_100M: float = 3.0   # >= this means darkness = 0
+
+# About 6,000 light records share a position with another record: two lights
+# on one pole, exact copies, or an old light that was replaced but never
+# removed. lights_clean keeps every record; Phase 2 counts each position ONCE
+# (positions rounded to this precision) for lights_per_100m and dark gaps.
+LIGHT_POSITION_ROUND_M: float = 0.1
 CRIME_NEAR_ROUTE_M: float = 50.0       # evaluation: crimes "passed" by a route
 
 # ---------------------------------------------------------------------------
