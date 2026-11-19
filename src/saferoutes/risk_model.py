@@ -34,8 +34,11 @@ FEATURE_GROUPS: dict[str, list[str]] = {
     "lighting": ["lights_50m", "avg_lights_per_100m", "min_lights_per_100m"],
     "street_form": ["n_main_roads", "has_path"],
     "season": ["label_quarter"],
-    "busyness": ["stops_200m", "sheltered_stops_200m"],   # from stops_clean (config.STOPS_NEAR_NODE_M)
-    # future: "night_trips_per_hour" (needs GTFS timetable), "venues_100m" (bars)
+    "busyness": ["stops_200m", "sheltered_stops_200m",   # stops_clean, within config.STOPS_NEAR_NODE_M
+                 "venues_100m"],                         # venues_clean, within config.VENUES_NEAR_NODE_M
+    "calls": ["calls_night_citizen_3m", "calls_night_citizen_12m",   # call_counts_monthly
+              "calls_night_urgent_12m"],
+    # future: "night_trips_per_hour" (needs the GTFS timetable)
 }
 
 

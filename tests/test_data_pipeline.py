@@ -114,3 +114,45 @@ def test_clean_stops() -> None:
     min_x, min_y, max_x, max_y = config.OTTAWA_BOUNDS_M
     assert all(min_x <= p.x <= max_x and min_y <= p.y <= max_y for p in stops.geometry)
     assert report.dropped == {"no location (Latitude/Longitude missing)": 1, "location outside Ottawa": 1}
+
+
+def test_clean_calls() -> None:
+    # Web Mercator x/y near downtown Ottawa
+    base = {"Received Date": "1/4/2021 5:00:00 AM", "Neighbourhood": "Centretown",
+            "Intersection": "ELGIN ST, LAURIER AVE W", "x": -8425000.0, "y": 5686500.0}
+    raw = pd.DataFrame([
+        {**base, "OBJECTID": 1, "Received Hour": 2300, "Priority": 2, "Initiated By": "C"},  # night, urgent, citizen
+        {**base, "OBJECTID": 2, "Received Hour": 0, "Priority": 4, "Initiated By": "O"},     # midnight counts as night
+        {**base, "OBJECTID": 3, "Received Hour": 1400, "Priority": 3, "Initiated By": "C"},  # daytime
+        {**base, "OBJECTID": 4, "Received Hour": 1400, "Priority": 3, "Initiated By": "C", "x": None},  # no location
+        {**base, "OBJECTID": 5, "Received Hour": 1400, "Priority": 9, "Initiated By": "C"},  # bad priority
+    ])
+    calls, report = data_pipeline.clean_calls(raw)
+    by_id = calls.set_index("call_id")
+
+    assert list(by_id.index) == [1, 2, 3]
+    assert by_id.loc[1, "is_night"] and by_id.loc[1, "is_urgent"] and by_id.loc[1, "initiated_by"] == "citizen"
+    assert by_id.loc[2, "is_night"] and by_id.loc[2, "hour"] == 0 and by_id.loc[2, "initiated_by"] == "officer"
+    assert not by_id.loc[3, "is_night"] and not by_id.loc[3, "is_urgent"]
+    assert by_id.loc[1, "received_date"] == pd.Timestamp("2021-01-04")
+    assert calls.crs.to_string() == config.CRS_METRES
+    assert report.dropped == {"priority missing or not 1-7": 1, "no location (x/y missing)": 1}
+
+
+def test_clean_venues() -> None:
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    raw = gpd.GeoDataFrame(
+        {"venue_id": ["node/1", "way/2", "node/1", "node/3"],
+         "kind": ["pub", "bar", "pub", "nightclub"],
+         "name": ["Heart & Crown", None, "Heart & Crown", "Far Away"],
+         "opening_hours": ["Mo-Su 11:00-02:00", None, "Mo-Su 11:00-02:00", None]},
+        geometry=[Point(-75.6935, 45.4290), Point(-75.69, 45.42), Point(-75.6935, 45.4290), Point(-60.0, 45.0)],
+        crs="EPSG:4326",
+    )
+    venues, report = data_pipeline.clean_venues(raw)
+    assert list(venues["venue_id"]) == ["node/1", "way/2"]
+    assert venues.crs.to_string() == config.CRS_METRES
+    assert report.dropped == {"same OpenStreetMap feature listed twice": 1, "location outside Ottawa": 1}
+    assert report.notes["with opening hours"] == 1

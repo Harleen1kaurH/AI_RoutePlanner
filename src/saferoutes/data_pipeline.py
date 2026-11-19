@@ -4,7 +4,7 @@ Owner: Data person
 
 Output files (see config.py for the exact columns):
     config.CRIME_CLEAN, config.LIGHTS_CLEAN, config.STOPS_CLEAN,
-    config.CLEANING_REPORT
+    config.CALLS_CLEAN, config.VENUES_CLEAN, config.CLEANING_REPORT
 
 The OpenStreetMap street network is loaded in Phase 2
 (street_graph.download_walk_graph), because it is built together with the graph.
@@ -12,6 +12,7 @@ The OpenStreetMap street network is loaded in Phase 2
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +54,19 @@ RAW_STOP_COLUMNS: dict[str, str] = {
     "Bench": "bench",         # "Y" or blank
     "Latitude": "lat",
     "Longitude": "lon",
+}
+
+# Raw calls-for-service column -> our column name.
+RAW_CALL_COLUMNS: dict[str, str] = {
+    "OBJECTID": "call_id",
+    "Received Date": "received_date",
+    "Received Hour": "received_hour",
+    "Priority": "priority",           # 1 (most urgent) to 7
+    "Initiated By": "initiated_by",   # C = citizen called, O = officer started it
+    "Neighbourhood": "neighbourhood",
+    "Intersection": "intersection",
+    "x": "x",
+    "y": "y",
 }
 
 # A crime reported this many days after it happened counts as "reported late"
@@ -331,16 +345,135 @@ def clean_stops(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
 
 
 # ---------------------------------------------------------------------------
-# Optional sources (only if time allows)
+# Calls for service
 # ---------------------------------------------------------------------------
+def load_raw_calls(path: Path = config.RAW_CALLS) -> pd.DataFrame:
+    """Read the Ottawa Police dispatched calls for service CSV as downloaded
+    (about 1.1 million rows, 2021-2025)."""
+    path = _find_raw_file(path, "Calls_For_Service*.csv")
+    raw = pd.read_csv(path, encoding="utf-8-sig", usecols=list(RAW_CALL_COLUMNS), low_memory=False)
+    _check_columns(raw, list(RAW_CALL_COLUMNS), "Calls for service file")
+    return raw
 
 
-def load_licensed_venues(path: Path = config.RAW_VENUES) -> gpd.GeoDataFrame:
-    """OPTIONAL. AGCO liquor licences, geocoded to points.
+def clean_calls(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+    """Clean the calls for service table.
 
-    Returns columns: venue_id, licence_type, geometry.
+    Calls have NO call type (we can't tell a fight from a noise complaint),
+    so they're used as features about how often police are needed somewhere,
+    never as the label.
+
+    Steps:
+        - "Received Date" -> received_date (date part only; the time is always 5:00 AM)
+        - "Received Hour" (e.g. 2200) -> hour (0-23). Hour 0 is real midnight
+          here, so is_night uses config.CALLS_NIGHT_HOURS (includes 0)
+        - Initiated By "C" -> "citizen", "O" -> "officer"
+        - is_urgent = priority <= config.URGENT_PRIORITY_MAX
+        - drop rows with no x/y; convert from Web Mercator to config.CRS_METRES
+
+    Returns columns listed at config.CALLS_CLEAN, and a report.
     """
-    raise NotImplementedError
+    _check_columns(raw, list(RAW_CALL_COLUMNS), "Calls for service file")
+    rows_in = len(raw)
+    dropped: dict[str, int] = {}
+
+    df = raw[list(RAW_CALL_COLUMNS)].rename(columns=RAW_CALL_COLUMNS)
+
+    # 1. Date
+    df["received_date"] = _parse_day(df["received_date"].astype(str))
+    df = _drop(df, df["received_date"].isna(), "received date missing or unreadable", dropped)
+    start, end = pd.Timestamp(config.DATA_START), pd.Timestamp(config.DATA_END)
+    df = _drop(df, (df["received_date"] < start) | (df["received_date"] > end),
+               f"received outside {config.DATA_START} to {config.DATA_END}", dropped)
+
+    # 2. Hour
+    hour_raw = pd.to_numeric(df["received_hour"], errors="coerce")
+    bad_hour = hour_raw.isna() | (hour_raw % 100 != 0) | ~hour_raw.between(0, 2300)
+    df = _drop(df, bad_hour, "received hour missing or not a whole hour", dropped)
+    df["hour"] = (pd.to_numeric(df["received_hour"]) // 100).astype(int)
+
+    # 3. Priority and who started the call
+    df["priority"] = pd.to_numeric(df["priority"], errors="coerce")
+    df = _drop(df, ~df["priority"].between(1, 7), "priority missing or not 1-7", dropped)
+    df["priority"] = df["priority"].astype(int)
+    who = df["initiated_by"].astype("string").str.strip().str.upper().map({"C": "citizen", "O": "officer"})
+    df = _drop(df, who.isna(), "initiated by missing or not C/O", dropped)
+    df["initiated_by"] = who.loc[df.index].astype(str)
+
+    # 4. Location
+    df = _drop(df, df["x"].isna() | df["y"].isna(), "no location (x/y missing)", dropped)
+    calls = gpd.GeoDataFrame(
+        df.drop(columns=["received_hour", "x", "y"]),
+        geometry=gpd.points_from_xy(df["x"], df["y"]),
+        crs=config.CRS_CALLS_RAW,
+    ).to_crs(config.CRS_METRES)
+    calls = _drop(calls, _outside_ottawa(calls.geometry.x, calls.geometry.y), "location outside Ottawa", dropped)
+
+    # 5. Flags
+    calls["is_night"] = calls["hour"].isin(config.CALLS_NIGHT_HOURS)
+    calls["is_urgent"] = calls["priority"] <= config.URGENT_PRIORITY_MAX
+
+    columns = ["call_id", "received_date", "hour", "priority", "initiated_by", "is_night",
+               "is_urgent", "neighbourhood", "intersection", "geometry"]
+    calls = calls[columns].reset_index(drop=True)
+
+    night = calls["is_night"]
+    notes = {
+        "started by a citizen": int((calls["initiated_by"] == "citizen").sum()),
+        "started by an officer": int((calls["initiated_by"] == "officer").sum()),
+        "night-time calls started by a citizen": int((night & (calls["initiated_by"] == "citizen")).sum()),
+        "night-time urgent calls (priority 1-2)": int((night & calls["is_urgent"]).sum()),
+        "no intersection name (location still present)": int(calls["intersection"].isna().sum()),
+    }
+    report = CleaningReport("calls for service", rows_in, len(calls), dropped, notes)
+    assert report.rows_in - sum(dropped.values()) == report.rows_out
+    return calls, report
+
+
+# ---------------------------------------------------------------------------
+# Bars and pubs (from OpenStreetMap)
+# ---------------------------------------------------------------------------
+def load_raw_venues(path: Path = config.RAW_OSM_VENUES) -> gpd.GeoDataFrame:
+    """Read the bars/pubs file made by `python scripts/00_download_osm.py --venues`."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path.name} not found in {path.parent}. "
+            "Run: python scripts/00_download_osm.py --venues   (needs internet)"
+        )
+    raw = gpd.read_parquet(path)
+    _check_columns(raw, ["venue_id", "kind", "name", "opening_hours", "geometry"], "Venues file")
+    return raw
+
+
+def clean_venues(raw: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+    """Clean the bars, pubs and nightclubs from OpenStreetMap.
+
+    Steps:
+        - drop venues with no location
+        - drop exact repeats of the same OpenStreetMap feature
+        - convert to config.CRS_METRES and drop venues outside Ottawa
+
+    opening_hours is kept as OpenStreetMap writes it (e.g. "Mo-Su 11:00-02:00"),
+    often missing; it isn't parsed yet.
+
+    Returns columns: venue_id, kind, name, opening_hours, geometry.
+    """
+    rows_in = len(raw)
+    dropped: dict[str, int] = {}
+
+    venues = raw[["venue_id", "kind", "name", "opening_hours", "geometry"]].copy()
+    venues = _drop(venues, venues.geometry.isna() | venues.geometry.is_empty, "no location", dropped)
+    venues = _drop(venues, venues["venue_id"].duplicated(), "same OpenStreetMap feature listed twice", dropped)
+
+    venues = venues.to_crs(config.CRS_METRES)
+    venues = _drop(venues, _outside_ottawa(venues.geometry.x, venues.geometry.y), "location outside Ottawa", dropped)
+    venues = gpd.GeoDataFrame(venues.reset_index(drop=True), geometry="geometry", crs=config.CRS_METRES)
+
+    notes = {f"kind = {k}": int(n) for k, n in venues["kind"].value_counts().items()}
+    notes["with opening hours"] = int(venues["opening_hours"].notna().sum())
+    report = CleaningReport("bars and pubs", rows_in, len(venues), dropped, notes)
+    assert report.rows_in - sum(dropped.values()) == report.rows_out
+    return venues, report
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +492,11 @@ def save_reports(reports: list[CleaningReport], path: Path = config.CLEANING_REP
 
 
 def run() -> list[CleaningReport]:
-    """Run all of Phase 1: load, clean and save crime, lights and bus stops.
+    """Run all of Phase 1: load, clean and save every dataset.
+
+    Crime and street lights are required. Bus stops, calls for service and
+    bars/pubs are skipped with a warning if their raw file is missing, so a
+    teammate without them can still run the rest.
 
     Returns the cleaning reports so the script can print them.
     """
@@ -368,10 +505,22 @@ def run() -> list[CleaningReport]:
 
     lights, lights_report = clean_lights(load_raw_lights())
     save_parquet(lights, config.LIGHTS_CLEAN)
+    reports = [crime_report, lights_report]
 
-    stops, stops_report = clean_stops(load_raw_stops())
-    save_parquet(stops, config.STOPS_CLEAN)
+    optional = [
+        ("bus stops", load_raw_stops, clean_stops, config.STOPS_CLEAN),
+        ("calls for service", load_raw_calls, clean_calls, config.CALLS_CLEAN),
+        ("bars and pubs", load_raw_venues, clean_venues, config.VENUES_CLEAN),
+    ]
+    for name, load, clean, out_path in optional:
+        try:
+            raw = load()
+        except FileNotFoundError as error:
+            warnings.warn(f"Skipping {name}: {error}", stacklevel=2)
+            continue
+        table, report = clean(raw)
+        save_parquet(table, out_path)
+        reports.append(report)
 
-    reports = [crime_report, lights_report, stops_report]
     save_reports(reports)
     return reports

@@ -3,7 +3,8 @@
 Owner: Data person
 
 No machine learning here. Output files:
-    config.STREET_GRAPH, config.CRIME_SNAPPED, config.CRIME_COUNTS_MONTHLY
+    config.STREET_GRAPH, config.CRIME_SNAPPED, config.CRIME_COUNTS_MONTHLY,
+    config.CALL_COUNTS_MONTHLY
 
 Every edge must end up with the attributes listed in config.EDGE_ATTRIBUTES
 (except model_risk_score, which routing.attach_model_risk adds later).
@@ -64,6 +65,18 @@ def monthly_crime_counts(crime_snapped: gpd.GeoDataFrame) -> pd.DataFrame:
     n_all, n_property, n_mischief, n_theft.
 
     This one table is shared by the ML model, the fallback and the evaluation.
+    """
+    raise NotImplementedError
+
+
+def monthly_call_counts(calls_snapped: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Count calls for service per intersection per month (snap calls to
+    intersections first, exactly like crimes).
+
+    Returns columns: node_id, month (first day of month),
+    n_calls_night_citizen, n_calls_night_urgent, n_calls_all.
+    Officer-started calls are left out of the night counts: they mostly show
+    where police patrol, not where trouble is.
     """
     raise NotImplementedError
 
