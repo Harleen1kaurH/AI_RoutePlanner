@@ -1,17 +1,26 @@
-"""Phase 1: load and clean the raw files.
+"""Phase 1, step 2: load and clean the raw files, and cut them to the study area.
 
 Run:  python scripts/01_prepare_data.py
-Needs: data/raw/ files (see data/README.md)
-Makes: data/processed/crime_clean.parquet, lights_clean.parquet
+Needs: data/raw/ files (see data/README.md), including study_area.parquet
+       from step 1 (python scripts/00_download_osm.py --venues --areas)
+Makes: data/processed/crime_clean.parquet, lights_clean.parquet, stops_clean.parquet,
+       calls_clean.parquet, venues_clean.parquet, results/cleaning_report.csv
+       (stops, calls and venues are skipped with a warning if their raw file is missing)
 """
 
-from saferoutes import data_pipeline
+from saferoutes import config, data_pipeline
 
 
 def main() -> None:
+    """Run Phase 1 and print each cleaning report and the saved file paths."""
     reports = data_pipeline.run()
     for report in reports:
         print(report)
+    print()
+    for path in (config.CRIME_CLEAN, config.LIGHTS_CLEAN, config.STOPS_CLEAN,
+                 config.CALLS_CLEAN, config.VENUES_CLEAN, config.CLEANING_REPORT):
+        if path.exists():
+            print(f"Saved {path}")
 
 
 if __name__ == "__main__":

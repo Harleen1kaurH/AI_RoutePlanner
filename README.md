@@ -38,7 +38,8 @@ Then download the raw data files into `data/raw/` (see `data/README.md`).
 Run the scripts in order. Each one saves its output, so later steps don't redo earlier ones.
 
 ```bash
-python scripts/01_prepare_data.py     # Phase 1: clean crime + lights
+python scripts/00_download_osm.py --venues --areas   # Phase 1, step 1 (once, needs internet): study area + map + bars + areas
+python scripts/01_prepare_data.py     # Phase 1, step 2: clean crime, lights, stops, calls, bars; cut to the study area
 python scripts/02_build_graph.py      # Phase 2: street graph + safety numbers
 python scripts/03_train_model.py      # Phase 3: ML model + risk per intersection
 python scripts/04_evaluate_routes.py  # Phase 6: compare the three routes
@@ -69,9 +70,13 @@ results/             tables and figures for the report (not in Git)
 
 | File | Made by | Used by | Columns / attributes |
 |---|---|---|---|
-| `crime_clean.parquet` | Phase 1 | everyone | occurred_date, hour, offence_summary, offence_category, is_person, is_night, hour_unknown, geometry |
-| `lights_clean.parquet` | Phase 1 | Phases 2, 3 | light_id, light_type, geometry |
+| `crime_clean.parquet` | Phase 1 | everyone | offence_id, occurred_date, reported_date, hour, offence_summary, offence_category, offence_group, is_person, is_night, hour_unknown, neighbourhood, intersection, geometry |
+| `lights_clean.parquet` | Phase 1 | Phases 2, 3 | light_id, light_type, n_heads, wattage, geometry |
+| `stops_clean.parquet` | Phase 1 | Phase 3 | stop_id, stop_code, stop_name, has_shelter, has_bench, geometry |
+| `calls_clean.parquet` | Phase 1 | Phase 2 | call_id, received_date, hour, priority, initiated_by, is_night, is_urgent, neighbourhood, intersection, geometry |
+| `venues_clean.parquet` | Phase 1 | Phase 3 | venue_id, kind, name, opening_hours, geometry |
 | `crime_counts_monthly.parquet` | Phase 2 | Phases 3, 6 | node_id, month, n_person_night, n_all, n_property, n_mischief, n_theft |
+| `call_counts_monthly.parquet` | Phase 2 | Phase 3 | node_id, month, n_calls_night_citizen, n_calls_night_urgent, n_calls_all |
 | `street_graph.graphml` | Phase 2 | Phases 3, 5, 6, 7 | edge attributes in `config.EDGE_ATTRIBUTES` |
 | `node_risk_eval.parquet` / `node_risk_demo.parquet` | Phase 3 | Phases 5, 6, 7 | node_id, probability, risk_score |
 

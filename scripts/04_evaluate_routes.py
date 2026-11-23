@@ -10,6 +10,7 @@ from saferoutes import config, evaluation
 
 
 def main() -> None:
+    """Run Phase 6: build the three routes for every test trip and save the results."""
     # 1. Load graph (crime numbers built with config.TEST_CUTOFF)
     # 2. Attach ML risk from node_risk_eval (routing.attach_model_risk)
     # 3. Sample trips, get test-period crimes

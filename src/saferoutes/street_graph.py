@@ -2,8 +2,12 @@
 
 Owner: Data person
 
-No machine learning here. Output files:
-    config.STREET_GRAPH, config.CRIME_SNAPPED, config.CRIME_COUNTS_MONTHLY
+No machine learning here. Inputs: config.RAW_OSM_GRAPH (from scripts/00_download_osm.py),
+        config.CRIME_CLEAN, config.LIGHTS_CLEAN, config.CALLS_CLEAN (Phase 1)
+
+Output files:
+    config.STREET_GRAPH, config.CRIME_SNAPPED, config.CRIME_COUNTS_MONTHLY,
+    config.CALL_COUNTS_MONTHLY
 
 Every edge must end up with the attributes listed in config.EDGE_ATTRIBUTES
 (except model_risk_score, which routing.attach_model_risk adds later).
@@ -24,35 +28,49 @@ from saferoutes import config
 # ---------------------------------------------------------------------------
 # Graph
 # ---------------------------------------------------------------------------
-def download_walk_graph(place: str = config.STUDY_AREA) -> nx.MultiDiGraph:
-    """Download the walking network with OSMnx and project it to config.CRS_METRES.
+def load_osm_walk_graph(path: Path = config.RAW_OSM_GRAPH) -> nx.MultiDiGraph:
+    """Load the walking network saved by scripts/00_download_osm.py and
+    convert it to config.CRS_METRES.
 
     Nodes = intersections (with x, y in metres). Edges = street segments
-    (with length in metres and OSM tags such as "highway").
+    (with length in metres and OSM tags such as "highway", "tunnel", "footway").
+    Raises FileNotFoundError with a hint to run 00_download_osm.py if missing.
     """
     raise NotImplementedError
 
 
-def restrict_to_urban_area(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
-    """Keep only urban Ottawa (e.g. inside the Greenbelt) and the largest
-    connected part of the network."""
+def keep_largest_piece(G: nx.MultiDiGraph) -> tuple[nx.MultiDiGraph, int]:
+    """Keep only the largest connected piece of the network, so every start
+    can reach every end.
+
+    The map was downloaded inside the study area (Gatineau already removed,
+    see data_pipeline.make_study_area), and OSMnx already keeps the largest
+    piece, so this is a safety check: on the current map it removes nothing.
+    Use nx.weakly_connected_components (streets go both ways for walking).
+
+    Returns (graph, number of intersections removed); put the number in the
+    Phase 2 report. If it is more than a few dozen, look at where they are on
+    a map: a real neighbourhood was cut off, so widen config.STUDY_MARGIN_M.
+    """
     raise NotImplementedError
 
 
 # ---------------------------------------------------------------------------
 # Crime -> intersections
 # ---------------------------------------------------------------------------
-def snap_crimes_to_nodes(
-    crime: gpd.GeoDataFrame,
+def snap_to_nodes(
+    points: gpd.GeoDataFrame,
     G: nx.MultiDiGraph,
     max_distance_m: float = config.SNAP_MAX_DISTANCE_M,
 ) -> tuple[gpd.GeoDataFrame, int]:
-    """Attach each crime to its nearest intersection.
+    """Attach each point (a crime or a call for service) to its nearest intersection.
 
-    Adds columns node_id and snap_distance_m. Crimes farther than
-    max_distance_m are dropped.
+    Adds columns node_id and snap_distance_m. Points farther than
+    max_distance_m from every intersection are dropped (e.g. in the middle of
+    a big park). Points outside the study area never get here: Phase 1
+    already dropped them, so every drop here means "too far from an intersection".
 
-    Returns (snapped crimes, number of crimes dropped).
+    Returns (snapped points, number of points dropped).
     """
     raise NotImplementedError
 
@@ -64,6 +82,18 @@ def monthly_crime_counts(crime_snapped: gpd.GeoDataFrame) -> pd.DataFrame:
     n_all, n_property, n_mischief, n_theft.
 
     This one table is shared by the ML model, the fallback and the evaluation.
+    """
+    raise NotImplementedError
+
+
+def monthly_call_counts(calls_snapped: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Count calls for service per intersection per month (snap calls to
+    intersections first, exactly like crimes).
+
+    Returns columns: node_id, month (first day of month),
+    n_calls_night_citizen, n_calls_night_urgent, n_calls_all.
+    Officer-started calls are left out of the night counts: they mostly show
+    where police patrol, not where trouble is.
     """
     raise NotImplementedError
 
@@ -80,6 +110,12 @@ def add_light_features(
 
     darkness = 1 - lights_per_100m / config.DARK_THRESHOLD_LIGHTS_PER_100M,
     clipped to [0, 1].
+
+    IMPORTANT: count each light POSITION once, not each record. Round positions
+    to config.LIGHT_POSITION_ROUND_M and drop repeats first, so a pole with two
+    records (two fixtures, a copied record, or a replaced light that was never
+    removed) counts as one lit spot. Twin-arm poles are slightly undercounted;
+    mention this in the report's limitations.
     """
     raise NotImplementedError
 
