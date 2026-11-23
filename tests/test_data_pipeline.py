@@ -156,3 +156,62 @@ def test_clean_venues() -> None:
     assert venues.crs.to_string() == config.CRS_METRES
     assert report.dropped == {"same OpenStreetMap feature listed twice": 1, "location outside Ottawa": 1}
     assert report.notes["with opening hours"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Study area
+# ---------------------------------------------------------------------------
+def _fake_city() -> "gpd.GeoDataFrame":
+    """A fake 'City' covering only the south half of the study box (in lat/lon),
+    like the river border cutting the box in two."""
+    import geopandas as gpd
+    from shapely.geometry import box
+
+    west, south, east, north = config.STUDY_BBOX_LATLON
+    middle = (south + north) / 2
+    return gpd.GeoDataFrame(geometry=[box(west - 1, south - 1, east + 1, middle)], crs="EPSG:4326")
+
+
+def test_make_study_area_cuts_to_city_and_adds_margin() -> None:
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    area = data_pipeline.make_study_area(_fake_city())
+    assert area.crs.to_string() == config.CRS_METRES and len(area) == 1
+    shape = area.geometry.iloc[0]
+
+    west, south, east, north = config.STUDY_BBOX_LATLON
+    middle = (south + north) / 2
+    points = gpd.GeoSeries(
+        [Point((west + east) / 2, south + 0.01),     # inside box, inside city -> in
+         Point((west + east) / 2, north - 0.01),     # inside box, outside city (the "Gatineau" half) -> out
+         Point((west + east) / 2, middle + 0.01)],   # just over the border -> out
+        crs="EPSG:4326",
+    ).to_crs(config.CRS_METRES)
+    assert [shape.contains(p) for p in points] == [True, False, False]
+
+    # the margin: a point 500 m south of the box edge is inside, 1,500 m is not
+    edge = gpd.GeoSeries([Point((west + east) / 2, south)], crs="EPSG:4326").to_crs(config.CRS_METRES).iloc[0]
+    assert shape.contains(Point(edge.x, edge.y - 500))
+    assert not shape.contains(Point(edge.x, edge.y - 1_500))
+
+
+def test_make_study_area_no_overlap_is_an_error() -> None:
+    import geopandas as gpd
+    from shapely.geometry import box
+
+    far_city = gpd.GeoDataFrame(geometry=[box(-60, 40, -59, 41)], crs="EPSG:4326")
+    with pytest.raises(ValueError):
+        data_pipeline.make_study_area(far_city)
+
+
+def test_clean_crime_drops_outside_study_area(raw_crime: pd.DataFrame) -> None:
+    from shapely.geometry import Point
+
+    # a study area of 1 km around downtown; crime 7 is in Ottawa but 10 km away
+    study_area = Point(DOWNTOWN).buffer(1_000)
+    raw = pd.concat([raw_crime, pd.DataFrame([_crime_row(OBJECTID=7, x=DOWNTOWN[0] + 10_000)])])
+    clean, report = data_pipeline.clean_crime(raw, study_area)
+    assert set(clean["offence_id"]) == {1, 2, 3}
+    assert report.dropped["outside the study area"] == 1
+    assert report.dropped["location outside Ottawa"] == 1   # still its own reason

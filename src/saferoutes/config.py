@@ -22,6 +22,8 @@ RESULTS: Path = ROOT / "results"
 # ---------------------------------------------------------------------------
 RAW_CRIME: Path = DATA_RAW / "Criminal_Offences_Open_Data.csv"
 RAW_LIGHTS: Path = DATA_RAW / "Street_Lights.csv"
+STUDY_AREA: Path = DATA_RAW / "study_area.parquet"         # made by scripts/00_download_osm.py
+#   one row: name (str), area_km2 (float), geometry (Polygon/MultiPolygon, CRS_METRES)
 RAW_OSM_GRAPH: Path = DATA_RAW / "osm_walk_raw.graphml"    # made by scripts/00_download_osm.py
 RAW_OSM_AREAS: Path = DATA_RAW / "osm_areas.parquet"       # optional, same script
 RAW_TRANSIT_STOPS: Path = DATA_RAW / "OC_Transpo_Stops.csv"
@@ -104,14 +106,24 @@ CRS_LATLON: str = "EPSG:4326"
 # ---------------------------------------------------------------------------
 # Study area
 # ---------------------------------------------------------------------------
-STUDY_AREA: str = "Ottawa, Ontario, Canada"   # narrowed to urban Ottawa in Phase 2
 DEMO_AREA: tuple[str, ...] = ("Centretown", "Byward Market", "Lowertown")
 
-# OpenStreetMap download area: (west, south, east, north) in longitude/latitude.
-# Default = urban Ottawa inside the Greenbelt (downtown + inner suburbs;
-# Kanata, Barrhaven and Orleans are NOT included). Change here if the team
-# picks a different study area, then re-run scripts/00_download_osm.py.
-OSM_BBOX_LATLON: tuple[float, float, float, float] = (-75.85, 45.33, -75.58, 45.47)
+# Team's study area (Phase 2 design doc, Decision 1): a box from Stittsville (west)
+# to Orleans (east), Manotic (south) to the Ottawa River (north); Findlay Creek is
+# inside. (west, south, east, north) in longitude/latitude. Check it on
+# bboxfinder.com before downloading.
+#
+# scripts/00_download_osm.py turns it into the study area (STUDY_AREA file):
+#   1. widen the box by STUDY_MARGIN_M on every side, so roads that run close
+#      to the edge are not cut into islands
+#   2. keep only the part inside the official City of Ottawa boundary
+#      (CITY_PLACE_NAME), which removes Gatineau exactly along the border
+# The map, bars and areas are downloaded inside it, and Phase 1 drops every
+# crime, light, stop and call outside it. Change these, then re-run
+# 00_download_osm.py and 01_prepare_data.py.
+STUDY_BBOX_LATLON: tuple[float, float, float, float] = (-75.97, 45.20, -75.44, 45.52)
+STUDY_MARGIN_M: float = 1_000.0
+CITY_PLACE_NAME: str = "City of Ottawa, Ontario, Canada"
 
 # Extra street tags to keep (OSMnx keeps highway, tunnel, bridge, service, ... by default)
 OSM_EXTRA_WAY_TAGS: tuple[str, ...] = ("covered", "footway", "lit")
@@ -130,8 +142,10 @@ OSM_VENUE_TAGS: dict[str, bool | str | list[str]] = {
     "amenity": ["bar", "pub", "nightclub", "biergarten"],
 }
 
-# Box around the City of Ottawa in CRS_METRES: (min_x, min_y, max_x, max_y).
-# Points outside it are location errors and are dropped.
+# Box around the whole City of Ottawa in CRS_METRES: (min_x, min_y, max_x, max_y).
+# Points outside it are location errors (e.g. a light near the equator) and are
+# dropped first; points inside it but outside the study area are dropped next,
+# under a separate reason.
 OTTAWA_BOUNDS_M: tuple[float, float, float, float] = (315_000.0, 4_979_000.0, 404_000.0, 5_046_000.0)
 
 # ---------------------------------------------------------------------------

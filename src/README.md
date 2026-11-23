@@ -35,8 +35,8 @@ Each file reads the files the previous one saved, and saves files for the next o
 
 | Script | Calls | Phase |
 |---|---|---|
-| `scripts/00_download_osm.py` | (its own code: OSMnx) | Download the map, bars and pubs (once) |
-| `scripts/01_prepare_data.py` | `data_pipeline.run()` | 1 |
+| `scripts/00_download_osm.py` | `data_pipeline.make_study_area` + OSMnx | 1, step 1: study area, map, bars, areas (once, needs internet) |
+| `scripts/01_prepare_data.py` | `data_pipeline.run()` | 1, step 2: clean and cut to the study area |
 | `scripts/02_build_graph.py` | `street_graph.run()` | 2 |
 | `scripts/03_train_model.py` | functions in `risk_model` | 3 |
 | `scripts/04_evaluate_routes.py` | functions in `evaluation` (which uses `routing`) | 6 |
@@ -62,12 +62,13 @@ Status: ✅ done · 🟡 stub (function names, inputs and outputs written; body 
 
 **Owner:** Data person
 
-**What it does:** reads each raw download, keeps the columns we need, fixes formats (dates, hours, yes/no flags), drops bad rows while counting why, converts every location to metres (EPSG:2951), and saves clean tables.
+**What it does:** builds the study area (the team's box + 1 km margin, cut to the City of Ottawa boundary, so Gatineau is removed); then reads each raw download, keeps the columns we need, fixes formats (dates, hours, yes/no flags), converts every location to metres (EPSG:2951), drops bad rows **and rows outside the study area** while counting why, and saves clean tables. After Phase 1, every table covers exactly the same area as the map.
 
 **Input** (`data/raw/`):
 
 | Raw file | Required? |
 |---|---|
+| `study_area.parquet` (from `00_download_osm.py`) | Yes |
 | `Criminal_Offences_Open_Data*.csv` (Ottawa Police) | Yes |
 | `Street_Lights*.csv` (Open Ottawa) | Yes |
 | `OC_Transpo_Stops*.csv` | Optional |
@@ -85,7 +86,7 @@ Status: ✅ done · 🟡 stub (function names, inputs and outputs written; body 
 | `venues_clean.parquet` | bar / pub / nightclub | kind, name, opening_hours, geometry |
 | `results/cleaning_report.csv` | drop reason or note | dataset, kind, item, count |
 
-**Main functions:** for each dataset, a `load_raw_…` (read the file as downloaded) and a `clean_…` (returns the clean table **and** a `CleaningReport`). `run()` does all of them in order and saves the results. Helpers starting with `_` are for use inside this file only.
+**Main functions:** `make_study_area` (used by `00_download_osm.py`) and `load_study_area`; for each dataset, a `load_raw_…` (read the file as downloaded) and a `clean_…(raw, study_area)` (returns the clean table **and** a `CleaningReport`; `study_area=None` keeps everything, which the tests use). `run()` loads the study area, then does all of them in order and saves the results. Helpers starting with `_` are for use inside this file only.
 
 **Used by:** every later phase.
 
@@ -95,7 +96,7 @@ Status: ✅ done · 🟡 stub (function names, inputs and outputs written; body 
 
 **Owner:** Data person
 
-**What it does:** loads the OpenStreetMap walking network, converts it to metres, keeps urban Ottawa only (removing Gatineau), attaches every crime and call to its nearest intersection, counts them per intersection per month, and puts safety numbers on every street. **No machine learning.**
+**What it does:** loads the OpenStreetMap walking network (already cut to the study area in Phase 1), converts it to metres, keeps the largest connected piece, attaches every crime and call to its nearest intersection, counts them per intersection per month, and puts safety numbers on every street. **No machine learning.**
 
 **Input:** `data/raw/osm_walk_raw.graphml` (from `00_download_osm.py`), `crime_clean`, `lights_clean`, `calls_clean`.
 
@@ -108,7 +109,9 @@ Status: ✅ done · 🟡 stub (function names, inputs and outputs written; body 
 | `crime_counts_monthly.parquet` | node_id, month, n_person_night, n_all, n_property, n_mischief, n_theft |
 | `call_counts_monthly.parquet` | node_id, month, n_calls_night_citizen, n_calls_night_urgent, n_calls_all |
 
-**Main functions:** `load_osm_walk_graph` → `restrict_to_urban_area` → `snap_to_nodes` (crimes and calls) → `monthly_crime_counts`, `monthly_call_counts` → `add_light_features`, `add_street_type_features`, `add_crime_count_features` → `save_graph`. `load_graph` reads the saved graph back for later phases.
+**Main functions:** `load_osm_walk_graph` → `keep_largest_piece` → `snap_to_nodes` (crimes and calls) → `monthly_crime_counts`, `monthly_call_counts` → `add_light_features`, `add_street_type_features`, `add_crime_count_features` → `save_graph`. `load_graph` reads the saved graph back for later phases.
+
+**Drops:** everything Phase 2 receives is already inside the study area, so the only drop is "more than 30 m from an intersection" (put the count in the Phase 2 report).
 
 **Important:** the crime numbers on streets count only crimes **before a cut-off date** (Oct 1, 2025 by default), so the evaluation never sees the crimes it's tested on.
 
@@ -195,6 +198,7 @@ The feature names, grouped for the ablation check, are in `FEATURE_GROUPS` at th
 
 | File | Made by | Read by |
 |---|---|---|
+| `study_area.parquet` | `00_download_osm.py` (`data_pipeline.make_study_area`) | `data_pipeline.run()`, `00_download_osm.py --skip-graph` |
 | `crime_clean.parquet` | `data_pipeline` | `street_graph`, `evaluation` |
 | `lights_clean.parquet` | `data_pipeline` | `street_graph`, `risk_model` |
 | `stops_clean.parquet` | `data_pipeline` | `risk_model` |

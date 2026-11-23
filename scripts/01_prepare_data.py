@@ -1,7 +1,8 @@
-"""Phase 1: load and clean the raw files.
+"""Phase 1, step 2: load and clean the raw files, and cut them to the study area.
 
 Run:  python scripts/01_prepare_data.py
-Needs: data/raw/ files (see data/README.md)
+Needs: data/raw/ files (see data/README.md), including study_area.parquet
+       from step 1 (python scripts/00_download_osm.py --venues --areas)
 Makes: data/processed/crime_clean.parquet, lights_clean.parquet, stops_clean.parquet,
        calls_clean.parquet, venues_clean.parquet, results/cleaning_report.csv
        (stops, calls and venues are skipped with a warning if their raw file is missing)

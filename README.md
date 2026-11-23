@@ -38,8 +38,8 @@ Then download the raw data files into `data/raw/` (see `data/README.md`).
 Run the scripts in order. Each one saves its output, so later steps don't redo earlier ones.
 
 ```bash
-python scripts/00_download_osm.py --venues   # once: OpenStreetMap map + bars/pubs (needs internet)
-python scripts/01_prepare_data.py     # Phase 1: clean crime, lights, stops, calls, bars
+python scripts/00_download_osm.py --venues --areas   # Phase 1, step 1 (once, needs internet): study area + map + bars + areas
+python scripts/01_prepare_data.py     # Phase 1, step 2: clean crime, lights, stops, calls, bars; cut to the study area
 python scripts/02_build_graph.py      # Phase 2: street graph + safety numbers
 python scripts/03_train_model.py      # Phase 3: ML model + risk per intersection
 python scripts/04_evaluate_routes.py  # Phase 6: compare the three routes

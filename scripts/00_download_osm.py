@@ -1,18 +1,24 @@
 """Download the OpenStreetMap data for the project (run ONCE, needs internet).
 
-Run:  python scripts/00_download_osm.py                    # walking network
-      python scripts/00_download_osm.py --venues           # also bars, pubs, nightclubs
-      python scripts/00_download_osm.py --areas --venues   # everything
+This is step 1 of Phase 1; then run 01_prepare_data.py.
+
+Run:  python scripts/00_download_osm.py --venues --areas   # everything (recommended)
+      python scripts/00_download_osm.py                    # study area + walking network only
       python scripts/00_download_osm.py --skip-graph --venues   # only bars (map already downloaded)
 
-Makes: data/raw/osm_walk_raw.graphml   (walking network, longitude/latitude)
+Makes: data/raw/study_area.parquet     (the study area, in metres; always made,
+                                        or reused with --skip-graph)
+       data/raw/osm_walk_raw.graphml   (walking network, longitude/latitude)
        data/raw/osm_areas.parquet      (only with --areas)
        data/raw/osm_venues.parquet     (only with --venues)
 
-The area and tags come from config.py (OSM_BBOX_LATLON, OSM_EXTRA_WAY_TAGS,
-OSM_AREA_TAGS, OSM_VENUE_TAGS). The files are saved as downloaded, not yet in metres:
-Phase 2 (02_build_graph.py) converts them. Share the saved files with the
-team (e.g. on Google Drive) so nobody has to download again.
+The study area = the team's box (config.STUDY_BBOX_LATLON) widened by
+config.STUDY_MARGIN_M and cut to the City of Ottawa boundary (removes Gatineau);
+see data_pipeline.make_study_area. Everything is downloaded inside it.
+Tags come from config.py (OSM_EXTRA_WAY_TAGS, OSM_AREA_TAGS, OSM_VENUE_TAGS).
+The map files are saved as downloaded (longitude/latitude): Phase 2 converts
+them to metres. Share the saved files with the team (e.g. on Google Drive) so
+nobody has to download again.
 
 Needs OSMnx 2 or newer:  pip install "osmnx>=2.0"
 """
@@ -28,32 +34,57 @@ import networkx as nx
 import osmnx as ox
 import pandas as pd
 
-from saferoutes import config
+from shapely.geometry.base import BaseGeometry
+
+from saferoutes import config, data_pipeline
+
+
+def get_study_area(reuse_saved: bool = False) -> BaseGeometry:
+    """Make (or, with reuse_saved, reload) the study area and return it in
+    longitude/latitude, the coordinates OSMnx downloads in.
+
+    Making it downloads the City of Ottawa boundary, cuts the widened box to it
+    (data_pipeline.make_study_area) and saves the result to config.STUDY_AREA.
+    """
+    if reuse_saved and config.STUDY_AREA.exists():
+        print(f"Using the saved study area {config.STUDY_AREA}")
+        area = gpd.read_parquet(config.STUDY_AREA)
+    else:
+        print(f"Downloading the boundary of {config.CITY_PLACE_NAME}...")
+        city = ox.geocode_to_gdf(config.CITY_PLACE_NAME)
+        area = data_pipeline.make_study_area(city)
+        area.to_parquet(config.STUDY_AREA, index=False)
+        print(f"  Saved {config.STUDY_AREA}")
+    print(f"  Study area: {area['area_km2'].iloc[0]:,.0f} km² "
+          f"(box {config.STUDY_BBOX_LATLON} + {config.STUDY_MARGIN_M:,.0f} m margin, cut to the City)")
+    return area.to_crs(config.CRS_LATLON).union_all()
 
 
 def download_walk_network(
-    bbox: tuple[float, float, float, float] = config.OSM_BBOX_LATLON,
+    area: BaseGeometry,
     extra_tags: tuple[str, ...] = config.OSM_EXTRA_WAY_TAGS,
 ) -> nx.MultiDiGraph:
-    """Download the walking network inside bbox (west, south, east, north).
+    """Download the walking network inside `area` (a shape in longitude/latitude).
 
+    Streets with an end outside the area are cut off at the last intersection
+    inside it. OSMnx keeps only the largest connected piece.
     Extra tags must be registered BEFORE the download, otherwise OSMnx drops them.
     """
     for tag in extra_tags:
         if tag not in ox.settings.useful_tags_way:
             ox.settings.useful_tags_way.append(tag)
-    return ox.graph_from_bbox(bbox, network_type="walk")
+    return ox.graph_from_polygon(area, network_type="walk")
 
 
 def download_areas(
-    bbox: tuple[float, float, float, float] = config.OSM_BBOX_LATLON,
+    area: BaseGeometry,
     tags: dict[str, bool | str | list[str]] = config.OSM_AREA_TAGS,
 ) -> gpd.GeoDataFrame:
-    """Download water, parks, parking lots and industrial land inside bbox.
+    """Download water, parks, parking lots and industrial land inside `area`.
 
     Returns columns: kind ("water", "park", "parking", "industrial"), geometry.
     """
-    features = ox.features_from_bbox(bbox, tags=tags)
+    features = ox.features_from_polygon(area, tags=tags)
 
     kind = pd.Series("other", index=features.index)
     if "landuse" in features:
@@ -72,10 +103,10 @@ def download_areas(
 
 
 def download_venues(
-    bbox: tuple[float, float, float, float] = config.OSM_BBOX_LATLON,
+    area: BaseGeometry,
     tags: dict[str, bool | str | list[str]] = config.OSM_VENUE_TAGS,
 ) -> gpd.GeoDataFrame:
-    """Download bars, pubs and nightclubs inside bbox.
+    """Download bars, pubs and nightclubs inside `area`.
 
     Some venues are mapped as a point, others as a building outline; outlines
     are replaced by a point inside them.
@@ -83,7 +114,7 @@ def download_venues(
     Returns columns: venue_id (e.g. "node/123"), kind, name, opening_hours,
     geometry (point, longitude/latitude).
     """
-    features = ox.features_from_bbox(bbox, tags=tags)
+    features = ox.features_from_polygon(area, tags=tags)
 
     def column(name: str) -> pd.Series:
         """The tag column `name`, or an empty column if no venue has that tag."""
@@ -116,12 +147,12 @@ def main() -> None:
     args = parser.parse_args()
 
     config.DATA_RAW.mkdir(parents=True, exist_ok=True)
-    print(f"Area (west, south, east, north): {config.OSM_BBOX_LATLON}")
+    area = get_study_area(reuse_saved=args.skip_graph)
 
     if not args.skip_graph:
         start = time.time()
-        print("Downloading the walking network... (a few minutes)")
-        G = download_walk_network()
+        print("Downloading the walking network... (10+ minutes for the full study area)")
+        G = download_walk_network(area)
         ox.save_graphml(G, config.RAW_OSM_GRAPH)
         print(f"  {G.number_of_nodes():,} intersections, {G.number_of_edges():,} street segments "
               f"in {time.time() - start:.0f} s")
@@ -130,7 +161,7 @@ def main() -> None:
     if args.areas:
         start = time.time()
         print("Downloading water, parks, parking and industrial areas...")
-        areas = download_areas()
+        areas = download_areas(area)
         areas.to_parquet(config.RAW_OSM_AREAS, index=False)
         print(f"  {len(areas):,} shapes in {time.time() - start:.0f} s: "
               f"{areas['kind'].value_counts().to_dict()}")
@@ -139,7 +170,7 @@ def main() -> None:
     if args.venues:
         start = time.time()
         print("Downloading bars, pubs and nightclubs...")
-        venues = download_venues()
+        venues = download_venues(area)
         venues.to_parquet(config.RAW_OSM_VENUES, index=False)
         print(f"  {len(venues):,} venues in {time.time() - start:.0f} s: "
               f"{venues['kind'].value_counts().to_dict()}")

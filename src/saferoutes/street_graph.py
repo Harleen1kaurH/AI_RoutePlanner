@@ -39,13 +39,18 @@ def load_osm_walk_graph(path: Path = config.RAW_OSM_GRAPH) -> nx.MultiDiGraph:
     raise NotImplementedError
 
 
-def restrict_to_urban_area(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
-    """Keep only urban Ottawa and the largest connected part of the network.
+def keep_largest_piece(G: nx.MultiDiGraph) -> tuple[nx.MultiDiGraph, int]:
+    """Keep only the largest connected piece of the network, so every start
+    can reach every end.
 
-    The download box also covers part of Gatineau (Quebec), north of the
-    Ottawa River. Our crime data covers Ottawa only, so Gatineau streets would
-    look crime-free: remove them. Then keep the largest connected piece so every
-    start can reach every end.
+    The map was downloaded inside the study area (Gatineau already removed,
+    see data_pipeline.make_study_area), and OSMnx already keeps the largest
+    piece, so this is a safety check: on the current map it removes nothing.
+    Use nx.weakly_connected_components (streets go both ways for walking).
+
+    Returns (graph, number of intersections removed); put the number in the
+    Phase 2 report. If it is more than a few dozen, look at where they are on
+    a map: a real neighbourhood was cut off, so widen config.STUDY_MARGIN_M.
     """
     raise NotImplementedError
 
@@ -61,8 +66,9 @@ def snap_to_nodes(
     """Attach each point (a crime or a call for service) to its nearest intersection.
 
     Adds columns node_id and snap_distance_m. Points farther than
-    max_distance_m from every intersection are dropped (e.g. outside the
-    study area, or on a highway).
+    max_distance_m from every intersection are dropped (e.g. in the middle of
+    a big park). Points outside the study area never get here: Phase 1
+    already dropped them, so every drop here means "too far from an intersection".
 
     Returns (snapped points, number of points dropped).
     """

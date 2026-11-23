@@ -10,7 +10,20 @@ Raw files are **not** stored in Git: they're too big and anyone can download the
 | `gtfs/` (folder, optional) | OC Transpo | https://octranspo.com/en/plan-your-trip/travel-tools/developers → GTFS static zip → unzip into this folder |
 | `Calls_For_Service.csv` | Ottawa Police Community Safety Data Portal | "Dispatched Calls For Service Open Data" → Download → CSV. Keep the downloaded name (any `Calls_For_Service*.csv` is found). About 145 MB, 2021–2025. |
 
-The OpenStreetMap street network is downloaded by `python scripts/00_download_osm.py`. Add `--venues` for bars, pubs and nightclubs (`osm_venues.parquet`) and `--areas` for water, parks, parking and industrial land (`osm_areas.parquet`). Use `--skip-graph` to fetch only the extras when the map is already downloaded. Run it once, then share the files with the team. The download area is `OSM_BBOX_LATLON` in `config.py`.
+### Study area and OpenStreetMap files
+
+Run `python scripts/00_download_osm.py --venues --areas` once (needs internet; 10+ minutes). It makes:
+
+| File | Contents |
+|---|---|
+| `study_area.parquet` | The study area: the team's box from Stittsville to Orléans and Manotic to the Ottawa River (`STUDY_BBOX_LATLON` in `config.py`), widened by 1 km (`STUDY_MARGIN_M`) and cut to the official City of Ottawa boundary, which removes Gatineau. In metres. |
+| `osm_walk_raw.graphml` | The walking network inside the study area (a few hundred MB) |
+| `osm_venues.parquet` | Bars, pubs and nightclubs (`--venues`) |
+| `osm_areas.parquet` | Water, parks, parking and industrial land (`--areas`) |
+
+Use `--skip-graph` to fetch only the extras when the map is already downloaded (it reuses the saved study area). Share the files with the team so nobody has to download again.
+
+**Phase 1 then drops every crime, light, stop, call and bar outside the study area** (counted as "outside the study area" in `results/cleaning_report.csv`), so every table covers the same area as the map. If you change the study area in `config.py`, re-run both `00_download_osm.py` and `01_prepare_data.py`.
 
 Team members can also share these files through the team's Google Drive folder instead of downloading them again.
 

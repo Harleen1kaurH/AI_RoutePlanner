@@ -6,9 +6,15 @@ Output files (see config.py for the exact columns):
     config.CRIME_CLEAN, config.LIGHTS_CLEAN, config.STOPS_CLEAN,
     config.CALLS_CLEAN, config.VENUES_CLEAN, config.CLEANING_REPORT
 
-The OpenStreetMap street network is downloaded by scripts/00_download_osm.py
-and loaded in Phase 2 (street_graph.load_osm_walk_graph). Bars and pubs come
-from the same script (--venues) and are cleaned here.
+Phase 1 has two steps:
+    1. scripts/00_download_osm.py (needs internet, run once): makes the study
+       area (make_study_area below) and downloads the OpenStreetMap map, bars
+       and areas inside it.
+    2. scripts/01_prepare_data.py (this file's run()): cleans every dataset and
+       drops everything outside the study area, so every table covers exactly
+       the same area as the map.
+
+The map itself is loaded in Phase 2 (street_graph.load_osm_walk_graph).
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
+import shapely
+from shapely.geometry.base import BaseGeometry
 
 from saferoutes import config
 
@@ -154,6 +162,28 @@ def _outside_ottawa(x: pd.Series, y: pd.Series) -> pd.Series:
     return ~(x.between(min_x, max_x) & y.between(min_y, max_y))
 
 
+def _outside_area(points: gpd.GeoSeries, area: BaseGeometry) -> pd.Series:
+    """True for every point outside `area` (both in config.CRS_METRES).
+
+    Uses shapely's fast point-in-polygon test, so 1 million calls take seconds.
+    """
+    shapely.prepare(area)
+    inside = shapely.contains_xy(area, points.x.to_numpy(), points.y.to_numpy())
+    return pd.Series(~inside, index=points.index)
+
+
+def _drop_outside_study_area(
+    table: gpd.GeoDataFrame, study_area: BaseGeometry | None, dropped: dict[str, int]
+) -> gpd.GeoDataFrame:
+    """Drop rows outside the study area (if one is given) and record how many.
+
+    study_area=None keeps everything; the unit tests use that.
+    """
+    if study_area is None:
+        return table
+    return _drop(table, _outside_area(table.geometry, study_area), "outside the study area", dropped)
+
+
 def _parse_day(text: pd.Series) -> pd.Series:
     """'1/24/2018 5:00:00 AM' -> 2018-01-24.
 
@@ -161,6 +191,53 @@ def _parse_day(text: pd.Series) -> pd.Series:
     date is kept. The real hour comes from the "Occurred Hour" column.
     """
     return pd.to_datetime(text.str.split(" ").str[0], format="%m/%d/%Y", errors="coerce")
+
+
+# ---------------------------------------------------------------------------
+# Study area
+# ---------------------------------------------------------------------------
+def make_study_area(
+    city_boundary: gpd.GeoDataFrame,
+    bbox: tuple[float, float, float, float] = config.STUDY_BBOX_LATLON,
+    margin_m: float = config.STUDY_MARGIN_M,
+) -> gpd.GeoDataFrame:
+    """Build the study area: the team's box, widened by margin_m, cut to the City.
+
+    bbox is (west, south, east, north) in longitude/latitude. city_boundary is
+    the official City of Ottawa shape (00_download_osm.py gets it from
+    OpenStreetMap with ox.geocode_to_gdf), in any coordinate system.
+
+    Steps:
+        1. box -> metres (config.CRS_METRES)
+        2. widen by margin_m on every side (square corners), so roads running
+           close to the edge stay connected instead of becoming islands
+        3. keep only the part inside the City; this removes Gatineau exactly
+           along the provincial border in the middle of the river
+
+    Returns one row: name, area_km2, geometry (in config.CRS_METRES).
+    """
+    box = gpd.GeoSeries([shapely.box(*bbox)], crs=config.CRS_LATLON).to_crs(config.CRS_METRES)
+    wide_box = box.iloc[0].buffer(margin_m, join_style="mitre")
+    city = city_boundary.to_crs(config.CRS_METRES).union_all()
+    area = shapely.make_valid(wide_box.intersection(city))
+    if area.is_empty:
+        raise ValueError("The study box and the City boundary don't overlap. Check STUDY_BBOX_LATLON.")
+    return gpd.GeoDataFrame(
+        {"name": ["study area"], "area_km2": [area.area / 1e6]},
+        geometry=[area],
+        crs=config.CRS_METRES,
+    )
+
+
+def load_study_area(path: Path = config.STUDY_AREA) -> BaseGeometry:
+    """Read the study area saved by scripts/00_download_osm.py, as one shape in
+    config.CRS_METRES."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path.name} not found in {path.parent}. "
+            "Run first: python scripts/00_download_osm.py --venues --areas   (needs internet)"
+        )
+    return gpd.read_parquet(path).to_crs(config.CRS_METRES).union_all()
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +251,9 @@ def load_raw_crime(path: Path = config.RAW_CRIME) -> pd.DataFrame:
     return raw
 
 
-def clean_crime(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+def clean_crime(
+    raw: pd.DataFrame, study_area: BaseGeometry | None = None
+) -> tuple[gpd.GeoDataFrame, CleaningReport]:
     """Clean the raw crime table.
 
     Steps:
@@ -184,6 +263,7 @@ def clean_crime(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
         - hour_unknown = hour == config.UNKNOWN_HOUR
         - is_night = hour in config.NIGHT_HOURS (never true when hour_unknown)
         - drop rows with no x/y; build Point geometry in config.CRS_METRES
+        - drop crimes outside study_area (if given)
 
     Returns the clean table (columns listed at config.CRIME_CLEAN) and a report.
     """
@@ -226,6 +306,7 @@ def clean_crime(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
         geometry=gpd.points_from_xy(df["x"], df["y"]),
         crs=config.CRS_CRIME_RAW,
     ).to_crs(config.CRS_METRES)
+    clean = _drop_outside_study_area(clean, study_area, dropped)
 
     columns = ["offence_id", "occurred_date", "reported_date", "hour", "offence_summary",
                "offence_category", "offence_group", "is_person", "is_night", "hour_unknown",
@@ -256,9 +337,11 @@ def load_raw_lights(path: Path = config.RAW_LIGHTS) -> pd.DataFrame:
     return raw
 
 
-def clean_lights(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+def clean_lights(
+    raw: pd.DataFrame, study_area: BaseGeometry | None = None
+) -> tuple[gpd.GeoDataFrame, CleaningReport]:
     """Drop lights with no location and convert from config.CRS_LIGHTS_RAW
-    to config.CRS_METRES.
+    to config.CRS_METRES, then drop lights outside study_area (if given).
 
     Returns columns: light_id, light_type, n_heads, wattage, geometry.
     Several records can share one position (one pole, several fixtures);
@@ -279,6 +362,7 @@ def clean_lights(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
 
     outside = _outside_ottawa(lights.geometry.x, lights.geometry.y)
     lights = _drop(lights, outside, "location outside Ottawa", dropped)
+    lights = _drop_outside_study_area(lights, study_area, dropped)
 
     lights["n_heads"] = pd.to_numeric(lights["n_heads"], errors="coerce").fillna(1).astype(int)
     lights["wattage"] = pd.to_numeric(lights["wattage"], errors="coerce").fillna(0).astype(int)
@@ -305,7 +389,9 @@ def load_raw_stops(path: Path = config.RAW_TRANSIT_STOPS) -> pd.DataFrame:
     return raw
 
 
-def clean_stops(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+def clean_stops(
+    raw: pd.DataFrame, study_area: BaseGeometry | None = None
+) -> tuple[gpd.GeoDataFrame, CleaningReport]:
     """Clean the OC Transpo stops table.
 
     Steps:
@@ -313,7 +399,7 @@ def clean_stops(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
         - Shelter / Bench are "Y" or blank -> has_shelter / has_bench (True/False)
         - drop rows with no latitude/longitude
         - convert from latitude/longitude (config.CRS_STOPS_RAW) to config.CRS_METRES
-        - drop stops outside the Ottawa box
+        - drop stops outside the Ottawa box, then outside study_area (if given)
 
     The file has stop locations only, no timetable, so it can't say how many
     buses stop at night. That needs the OC Transpo GTFS timetable (future work).
@@ -341,6 +427,7 @@ def clean_stops(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
 
     outside = _outside_ottawa(stops.geometry.x, stops.geometry.y)
     stops = _drop(stops, outside, "location outside Ottawa", dropped)
+    stops = _drop_outside_study_area(stops, study_area, dropped)
 
     stops = stops[["stop_id", "stop_code", "stop_name", "has_shelter", "has_bench", "geometry"]]
     stops = stops.reset_index(drop=True)
@@ -369,7 +456,9 @@ def load_raw_calls(path: Path = config.RAW_CALLS) -> pd.DataFrame:
     return raw
 
 
-def clean_calls(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+def clean_calls(
+    raw: pd.DataFrame, study_area: BaseGeometry | None = None
+) -> tuple[gpd.GeoDataFrame, CleaningReport]:
     """Clean the calls for service table.
 
     Calls have NO call type (we can't tell a fight from a noise complaint),
@@ -383,6 +472,7 @@ def clean_calls(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
         - Initiated By "C" -> "citizen", "O" -> "officer"
         - is_urgent = priority <= config.URGENT_PRIORITY_MAX
         - drop rows with no x/y; convert from Web Mercator to config.CRS_METRES
+        - drop calls outside study_area (if given)
 
     Returns columns listed at config.CALLS_CLEAN, and a report.
     """
@@ -421,6 +511,7 @@ def clean_calls(raw: pd.DataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
         crs=config.CRS_CALLS_RAW,
     ).to_crs(config.CRS_METRES)
     calls = _drop(calls, _outside_ottawa(calls.geometry.x, calls.geometry.y), "location outside Ottawa", dropped)
+    calls = _drop_outside_study_area(calls, study_area, dropped)
 
     # 5. Flags
     calls["is_night"] = calls["hour"].isin(config.CALLS_NIGHT_HOURS)
@@ -458,13 +549,16 @@ def load_raw_venues(path: Path = config.RAW_OSM_VENUES) -> gpd.GeoDataFrame:
     return raw
 
 
-def clean_venues(raw: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, CleaningReport]:
+def clean_venues(
+    raw: gpd.GeoDataFrame, study_area: BaseGeometry | None = None
+) -> tuple[gpd.GeoDataFrame, CleaningReport]:
     """Clean the bars, pubs and nightclubs from OpenStreetMap.
 
     Steps:
         - drop venues with no location
         - drop exact repeats of the same OpenStreetMap feature
-        - convert to config.CRS_METRES and drop venues outside Ottawa
+        - convert to config.CRS_METRES and drop venues outside Ottawa, then
+          outside study_area (if given)
 
     opening_hours is kept as OpenStreetMap writes it (e.g. "Mo-Su 11:00-02:00"),
     often missing; it isn't parsed yet.
@@ -480,6 +574,7 @@ def clean_venues(raw: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, CleaningRepor
 
     venues = venues.to_crs(config.CRS_METRES)
     venues = _drop(venues, _outside_ottawa(venues.geometry.x, venues.geometry.y), "location outside Ottawa", dropped)
+    venues = _drop_outside_study_area(venues, study_area, dropped)
     venues = gpd.GeoDataFrame(venues.reset_index(drop=True), geometry="geometry", crs=config.CRS_METRES)
 
     notes = {f"kind = {k}": int(n) for k, n in venues["kind"].value_counts().items()}
@@ -507,16 +602,20 @@ def save_reports(reports: list[CleaningReport], path: Path = config.CLEANING_REP
 def run() -> list[CleaningReport]:
     """Run all of Phase 1: load, clean and save every dataset.
 
-    Crime and street lights are required. Bus stops, calls for service and
+    The study area (made by scripts/00_download_osm.py) is required: every
+    table is cut to it, so it matches the map. Crime and street lights are
+    required too. Bus stops, calls for service and
     bars/pubs are skipped with a warning if their raw file is missing, so a
     teammate without them can still run the rest.
 
     Returns the cleaning reports so the script can print them.
     """
-    crime, crime_report = clean_crime(load_raw_crime())
+    study_area = load_study_area()
+
+    crime, crime_report = clean_crime(load_raw_crime(), study_area)
     save_parquet(crime, config.CRIME_CLEAN)
 
-    lights, lights_report = clean_lights(load_raw_lights())
+    lights, lights_report = clean_lights(load_raw_lights(), study_area)
     save_parquet(lights, config.LIGHTS_CLEAN)
     reports = [crime_report, lights_report]
 
@@ -531,7 +630,7 @@ def run() -> list[CleaningReport]:
         except FileNotFoundError as error:
             warnings.warn(f"Skipping {name}: {error}", stacklevel=2)
             continue
-        table, report = clean(raw)
+        table, report = clean(raw, study_area)
         save_parquet(table, out_path)
         reports.append(report)
 
