@@ -19,7 +19,7 @@ from shapely.geometry import Point
 
 from saferoutes import config, street_graph
 
-X0, Y0 = 367966.7, 5031560.6   # Elgin & Laurier, MTM zone 9 (same as test_data_pipeline.py)
+X0, Y0 = 367966.7, 5031560.6   # Elgin & Laurier, (same as test_data_pipeline.py)
 
 
 def _empty_map() -> nx.MultiDiGraph:
