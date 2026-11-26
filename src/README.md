@@ -104,7 +104,7 @@ Status: ✅ done · 🟡 stub (function names, inputs and outputs written; body 
 
 | File | Contents |
 |---|---|
-| `street_graph.graphml` | Intersections (nodes with x, y) and streets (edges). Every street carries: length, lights_per_100m, longest_dark_gap_m, darkness, street_type, isolated, underpass, past_crimes_12m, crime_score |
+| `street_graph.graphml` | Intersections (nodes with x, y) and streets (edges). Every street carries: length, lights_per_100m, longest_dark_gap_m, darkness, street_type, isolated, underpass, past_crimes, crime_score |
 | `crime_snapped.parquet` | `crime_clean` + `node_id` and `snap_distance_m` |
 | `crime_counts_monthly.parquet` | node_id, month, n_person_night, n_all, n_property, n_mischief, n_theft |
 | `call_counts_monthly.parquet` | node_id, month, n_calls_night_citizen, n_calls_night_urgent, n_calls_all |
