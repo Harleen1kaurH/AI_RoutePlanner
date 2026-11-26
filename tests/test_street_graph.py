@@ -229,13 +229,13 @@ def test_add_crime_count_features_uses_only_crimes_before_cutoff() -> None:
     G.add_edge(3, 4)
     counts = pd.DataFrame({
         "node_id": [2, 3, 3, 4, 4],
-        "month": pd.to_datetime(["2025-03-01", "2025-06-01", "2025-09-01", "2025-10-01", "2023-01-01"]),
+        "month": pd.to_datetime(["2025-03-01", "2025-06-01", "2025-09-01", "2025-10-01", "2021-12-01"]),
         "n_person_night": [1, 2, 4, 50, 70],   # node 4: on the cut-off month, and too old
     })
 
     street_graph.add_crime_count_features(G, counts, date(2025, 10, 1))
 
-    past = [G.edges[u, v, 0]["past_crimes_12m"] for u, v in [(1, 2), (2, 3), (3, 4)]]
+    past = [G.edges[u, v, 0]["past_crimes"] for u, v in [(1, 2), (2, 3), (3, 4)]]
     assert past == [0.5, 3.5, 3.0]                            # node 4's crimes are not used
     average = (0.5 + 3.5 + 3.0) / 3                           # option C: streets that had crime
     assert G.edges[2, 3, 0]["crime_score"] == pytest.approx(3.5 / average, abs=0.001)
@@ -256,7 +256,7 @@ def test_add_crime_count_features_caps_the_score() -> None:
 
     street_graph.add_crime_count_features(G, counts, date(2025, 10, 1))
 
-    assert G.edges[1, 2, 0]["crime_score"] == street_graph.CRIME_SCORE_CAP
+    assert G.edges[1, 2, 0]["crime_score"] == config.CRIME_SCORE_CAP
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +268,7 @@ def test_save_and_load_keep_numbers_as_numbers(tmp_path: Path) -> None:
     G.add_node(2, x=X0 + 100, y=Y0, street_count=1)
     G.add_edge(1, 2, length=100.0, highway=["residential", "path"], street_type="residential",
                isolated=1, underpass=0, lights_per_100m=2.5, longest_dark_gap_m=40.0,
-               darkness=0.167, past_crimes_12m=0.5, crime_score=0.54)
+               darkness=0.167, past_crimes=0.5, crime_score=0.54)
     G.graph["crime_cutoff"] = "2025-10-01"
     G.graph["crime_score_average"] = 0.92
     path = tmp_path / "street_graph.graphml"

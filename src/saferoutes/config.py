@@ -88,8 +88,8 @@ EDGE_ATTRIBUTES: tuple[str, ...] = (
     "street_type",       # OSM highway tag, e.g. "primary", "footway"
     "isolated",          # 0/1: park path, alley, parking lot, industrial
     "underpass",         # 0/1: tunnel or covered
-    "past_crimes_12m",   # avg of the two end intersections (fallback crime number)
-    "crime_score",       # past_crimes_12m / city average (Route 2)
+    "past_crimes",       # avg of the two end intersections, crimes since CRIME_HISTORY_START (fallback crime number)
+    "crime_score",       # past_crimes / avg of streets that had crime, capped at CRIME_SCORE_CAP (Route 2)
     "model_risk_score",  # ML risk, avg of two ends / city average (Route 3)
 )
 
@@ -205,6 +205,51 @@ DARK_THRESHOLD_LIGHTS_PER_100M: float = 3.0   # >= this means darkness = 0
 # (positions rounded to this precision) for lights_per_100m and dark gaps.
 LIGHT_POSITION_ROUND_M: float = 0.1
 CRIME_NEAR_ROUTE_M: float = 50.0       # evaluation: crimes "passed" by a route
+
+# ---------------------------------------------------------------------------
+# Street graph (Phase 2)
+# ---------------------------------------------------------------------------
+MERGE_DISTANCE_M: float = 10.0   # merge intersections closer than this
+PHASE2_REPORT: Path = RESULTS / "phase2_report.csv"               # like CLEANING_REPORT
+PHASE2_DROPPED: Path = RESULTS / "phase2_dropped_points.parquet"  # every dropped crime/call + reason
+
+# offence_group values (OFFENCE_GROUPS) that count as crimes against property
+PROPERTY_GROUPS: tuple[str, ...] = ("theft", "mischief", "break_and_enter")
+
+# Lighting: streets shorter than this are treated as this long when computing lights per 100 m
+MIN_LIGHT_LENGTH_M: float = 10.0
+
+# Crime numbers on streets count crimes from this date up to the cut-off
+CRIME_HISTORY_START: date = date(2022, 1, 1)
+# Crime score: highest crime_score a street can get
+CRIME_SCORE_CAP: float = 10.0
+
+# Number types of the attributes Phase 2 adds, so load_graph can turn them
+# back from text into numbers (as GraphML stores everything as text).
+EDGE_NUMBER_TYPES: dict[str, type] = {
+    "lights_per_100m": float,
+    "longest_dark_gap_m": float,
+    "darkness": float,
+    "isolated": int,
+    "underpass": int,
+    "past_crimes": float,
+    "crime_score": float,
+    "model_risk_score": float,   # added later by routing.attach_model_risk
+}
+GRAPH_NUMBER_TYPES: dict[str, type] = {"crime_score_average": float}
+
+# Street-type rules for add_street_type_features
+ISOLATED_HIGHWAYS: set[str] = {"path", "track", "steps"}
+STREET_SIDE_FOOTWAYS: set[str] = {"sidewalk", "crossing"}      # footways that are NOT isolated
+ISOLATED_SERVICES: set[str] = {"alley", "parking_aisle", "driveway"}
+UNDERPASS_TUNNEL_TAGS: set[str] = {"yes", "building_passage"}  # not "culvert"
+# Most important first; used to pick one street_type when a street has several
+STREET_TYPE_ORDER: tuple[str, ...] = (
+    "motorway", "trunk", "primary", "secondary", "tertiary",
+    "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
+    "unclassified", "residential", "living_street", "pedestrian", "service",
+    "footway", "cycleway", "bridleway", "path", "steps", "track",
+)
 
 # ---------------------------------------------------------------------------
 # Time split (Phase 3)

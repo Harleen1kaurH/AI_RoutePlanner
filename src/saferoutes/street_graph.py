@@ -131,53 +131,12 @@ def keep_largest_piece(G: nx.MultiDiGraph) -> tuple[nx.MultiDiGraph, int]:
 
 
 # ---------------------------------------------------------------------------
-# Crime -> intersections
+# Crime and Call per intersections
 # ---------------------------------------------------------------------------
-# offence_group values (config.OFFENCE_GROUPS) that count as crimes against property
-PROPERTY_GROUPS: tuple[str, ...] = ("theft", "mischief", "break_and_enter")
-
-# Lighting: streets shorter than this are treated as this long when computing lights per 100 m
-MIN_LIGHT_LENGTH_M: float = 10.0
-
-# Crime score: highest crime_score a street can get
-CRIME_SCORE_CAP: float = 10.0
-
-# Number types of the attributes Phase 2 adds, so load_graph can turn them
-# back from text into numbers (as GraphML stores everything as text).
-EDGE_NUMBER_TYPES: dict[str, type] = {
-    "lights_per_100m": float,
-    "longest_dark_gap_m": float,
-    "darkness": float,
-    "isolated": int,
-    "underpass": int,
-    "past_crimes_12m": float,
-    "crime_score": float,
-    "model_risk_score": float,   # added later by routing.attach_model_risk
-}
-GRAPH_NUMBER_TYPES: dict[str, type] = {"crime_score_average": float}
-
-# run(): settings and report files
-MERGE_DISTANCE_M: float = 10.0   # merge intersections closer than this
-PHASE2_REPORT: Path = config.RESULTS / "phase2_report.csv"              # like Phase 1's cleaning_report.csv
-PHASE2_DROPPED: Path = config.RESULTS / "phase2_dropped_points.parquet"  # every dropped crime/call + reason
 SNAP_DROP_REASON: str = (
     f"more than {config.SNAP_MAX_DISTANCE_M:g} m from the nearest intersection "
     "(e.g. inside a large park or lot, or where the police point and the OSM map disagree)"
 )
-
-# Street-type rules for add_street_type_features 
-ISOLATED_HIGHWAYS: set[str] = {"path", "track", "steps"}
-STREET_SIDE_FOOTWAYS: set[str] = {"sidewalk", "crossing"}      # footways that are NOT isolated
-ISOLATED_SERVICES: set[str] = {"alley", "parking_aisle", "driveway"}
-UNDERPASS_TUNNEL_TAGS: set[str] = {"yes", "building_passage"}  # not "culvert"
-# Most important first; used to pick one street_type when a street has several
-STREET_TYPE_ORDER: tuple[str, ...] = (
-    "motorway", "trunk", "primary", "secondary", "tertiary",
-    "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
-    "unclassified", "residential", "living_street", "pedestrian", "service",
-    "footway", "cycleway", "bridleway", "path", "steps", "track",
-)
-
 
 def snap_to_nodes(
     points: gpd.GeoDataFrame,
@@ -228,7 +187,7 @@ def monthly_crime_counts(crime_snapped: gpd.GeoDataFrame) -> pd.DataFrame:
 
     Only (intersection, month) pairs with at least one crime get a row: a
     missing row means 0 crimes that month.
-    n_property = theft + mischief + break-and-enter (PROPERTY_GROUPS). Fraud is
+    n_property = theft + mischief + break-and-enter (config.PROPERTY_GROUPS). Fraud is
     left out: it is often recorded at a home or police station, not on the street.
     """
 
@@ -241,7 +200,7 @@ def monthly_crime_counts(crime_snapped: gpd.GeoDataFrame) -> pd.DataFrame:
         # night crime against the person; 
         "n_person_night": crime_snapped["is_person"] & crime_snapped["is_night"],
         "n_all": True,                                   # every crime counts here
-        "n_property": group.isin(PROPERTY_GROUPS),
+        "n_property": group.isin(config.PROPERTY_GROUPS),
         "n_mischief": group == "mischief",
         "n_theft": group == "theft",
     })
@@ -288,7 +247,7 @@ def monthly_call_counts(calls_snapped: gpd.GeoDataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Safety numbers on edges (each function edits G in place)
+# Adding features on edges (each function edits G in place)
 # ---------------------------------------------------------------------------
 def add_light_features(
     G: nx.MultiDiGraph,
@@ -307,7 +266,7 @@ def add_light_features(
 
     Lights a few metres apart are NOT merged, only records at
     the same position are counted once. A light near a corner counts for every
-    street meeting there. Streets shorter than MIN_LIGHT_LENGTH_M
+    street meeting there. Streets shorter than config.MIN_LIGHT_LENGTH_M
     (10 m) are treated as 10 m long.
     """
     # Counting each light POSITION once: round x, y to 0.1 m and drop repeats.
@@ -354,7 +313,7 @@ def add_light_features(
     longest_gap = np.where(n_lights == 0, line_length, longest_gap)    # no light at all
     length = np.array([float(data["length"]) for _, _, _, data in edges])
 
-    lights_per_100m = n_lights / np.maximum(length, MIN_LIGHT_LENGTH_M) * 100
+    lights_per_100m = n_lights / np.maximum(length, config.MIN_LIGHT_LENGTH_M) * 100
     darkness = np.clip(1 - lights_per_100m / config.DARK_THRESHOLD_LIGHTS_PER_100M, 0, 1)
     longest_gap = np.minimum(longest_gap, length)
 
@@ -390,12 +349,12 @@ def add_street_type_features(G: nx.MultiDiGraph) -> None:
         covered = _tag_values(data.get("covered"))
 
         # Underpass: any tunnel / building passage / covered tag.
-        underpass = bool(tunnel & UNDERPASS_TUNNEL_TAGS) or "yes" in covered
+        underpass = bool(tunnel & config.UNDERPASS_TUNNEL_TAGS) or "yes" in covered
 
         # Isolated: checks the three kinds of quiet streets, plus underpasses.
-        is_path = bool(highway & ISOLATED_HIGHWAYS)
-        is_offstreet_footway = "footway" in highway and not (footway & STREET_SIDE_FOOTWAYS)
-        is_back_lane = "service" in highway and bool(service & ISOLATED_SERVICES)
+        is_path = bool(highway & config.ISOLATED_HIGHWAYS)
+        is_offstreet_footway = "footway" in highway and not (footway & config.STREET_SIDE_FOOTWAYS)
+        is_back_lane = "service" in highway and bool(service & config.ISOLATED_SERVICES)
         isolated = is_path or is_offstreet_footway or is_back_lane or underpass
 
         # Saving the three numbers on the street.
@@ -407,21 +366,20 @@ def add_crime_count_features(
     G: nx.MultiDiGraph,
     counts: pd.DataFrame,
     cutoff: date,
-    months: int = 12,
+    start: date = config.CRIME_HISTORY_START,
 ) -> None:
     """Add the fallback crime numbers to every edge, using only crimes
     BEFORE cutoff.
 
-    past_crimes_12m = average of the night person-crime counts at the
-                      edge's two end intersections over the `months` before cutoff
-    crime_score     = past_crimes_12m / average past_crimes_12m of the streets
-                      that HAD crime, capped at CRIME_SCORE_CAP (10)
+    past_crimes     = average of the night person-crime counts at the
+                      edge's two end intersections, from `start` up to cutoff
+    crime_score     = past_crimes / average past_crimes of the streets
+                      that HAD crime, capped at config.CRIME_SCORE_CAP (10)
     """
-    # Keep only the months in the window: from `months` months before the
-    # cut-off, up to (NOT including) the cut-off month. 
+    # Keep only the months in the window: from `start`, up to (NOT including)
+    # the cut-off month.
     end = pd.Timestamp(cutoff)
-    start = end - pd.DateOffset(months=months)
-    in_window = (counts["month"] >= start) & (counts["month"] < end)
+    in_window = (counts["month"] >= pd.Timestamp(start)) & (counts["month"] < end)
 
     # Total night person-crimes per intersection in that window.
     per_node = counts.loc[in_window].groupby("node_id")["n_person_night"].sum()
@@ -436,11 +394,11 @@ def add_crime_count_features(
 
     # Average over the streets that had crime, then divide and cap.
     average = past[past > 0].mean() if (past > 0).any() else 1.0
-    crime_score = np.minimum(past / average, CRIME_SCORE_CAP)
+    crime_score = np.minimum(past / average, config.CRIME_SCORE_CAP)
 
     # Saving the numbers on every street, and the settings on the graph.
     for i, (_, _, data) in enumerate(edges):
-        data["past_crimes_12m"] = round(float(past[i]), 3)
+        data["past_crimes"] = round(float(past[i]), 3)
         data["crime_score"] = round(float(crime_score[i]), 3)
     G.graph["crime_cutoff"] = str(cutoff)
     G.graph["crime_score_average"] = round(float(average), 4)
@@ -466,8 +424,8 @@ def load_graph(path: Path = config.STREET_GRAPH) -> nx.MultiDiGraph:
     #  Read the file. OSMnx turns text into numbers
     return ox.load_graphml(
         path,
-        edge_dtypes=EDGE_NUMBER_TYPES,
-        graph_dtypes=GRAPH_NUMBER_TYPES,
+        edge_dtypes=config.EDGE_NUMBER_TYPES,
+        graph_dtypes=config.GRAPH_NUMBER_TYPES,
     )
 
 
@@ -476,20 +434,20 @@ def run(cutoff: date = config.TEST_CUTOFF) -> nx.MultiDiGraph:
 
     Saves config.STREET_GRAPH, config.CRIME_SNAPPED, config.CRIME_COUNTS_MONTHLY
     and config.CALL_COUNTS_MONTHLY, plus for the written report:
-        PHASE2_REPORT        what came in, what was dropped and why, useful counts
-        PHASE2_DROPPED       every dropped crime and call, with its reason
+        config.PHASE2_REPORT        what came in, what was dropped and why, useful counts
+        config.PHASE2_DROPPED       every dropped crime and call, with its reason
     """
     reports: list[CleaningReport] = []
 
     # load, merge sidewalk corners, keep the connected part.
     G = load_osm_walk_graph()
     n_raw = G.number_of_nodes()
-    G, n_merged = merge_close_intersections(G, MERGE_DISTANCE_M)
+    G, n_merged = merge_close_intersections(G, config.MERGE_DISTANCE_M)
     G, n_cut_off = keep_largest_piece(G)
     reports.append(CleaningReport(
         "street graph (intersections)", n_raw, G.number_of_nodes(),
         dropped={
-            f"merged into a nearby intersection (closer than {MERGE_DISTANCE_M:g} m), "
+            f"merged into a nearby intersection (closer than {config.MERGE_DISTANCE_M:g} m), "
             "so one real corner is one node": n_merged,
             "not connected to the main network, so no route could reach it": n_cut_off,
         },
@@ -548,16 +506,16 @@ def run(cutoff: date = config.TEST_CUTOFF) -> nx.MultiDiGraph:
             "underpass street segments": sum(d["underpass"] for d in streets),
             "street segments with no light within 25 m": sum(d["lights_per_100m"] == 0 for d in streets),
             "street segments with crime_score above 0": sum(d["crime_score"] > 0 for d in streets),
-            f"street segments at the crime_score cap ({CRIME_SCORE_CAP:g})":
-                sum(d["crime_score"] >= CRIME_SCORE_CAP for d in streets),
+            f"street segments at the crime_score cap ({config.CRIME_SCORE_CAP:g})":
+                sum(d["crime_score"] >= config.CRIME_SCORE_CAP for d in streets),
         },
     ))
 
     # Save the graph and the report.
     save_graph(G)
-    PHASE2_REPORT.parent.mkdir(parents=True, exist_ok=True)
-    pd.concat([r.to_frame() for r in reports], ignore_index=True).to_csv(PHASE2_REPORT, index=False)
-    pd.concat([dropped_crime, dropped_calls], ignore_index=True).to_parquet(PHASE2_DROPPED, index=False)
+    config.PHASE2_REPORT.parent.mkdir(parents=True, exist_ok=True)
+    pd.concat([r.to_frame() for r in reports], ignore_index=True).to_csv(config.PHASE2_REPORT, index=False)
+    pd.concat([dropped_crime, dropped_calls], ignore_index=True).to_parquet(config.PHASE2_DROPPED, index=False)
 
     return G
 
@@ -576,10 +534,10 @@ def _tag_values(value: object) -> set[str]:
 
 def _main_street_type(highway: set[str]) -> str:
     """Pick one street type when a street has several: the most important
-    road in STREET_TYPE_ORDER (e.g. {"residential", "path"} -> "residential")."""
+    road in config.STREET_TYPE_ORDER (e.g. {"residential", "path"} -> "residential")."""
     if not highway:
         return "unknown"
-    known = [t for t in STREET_TYPE_ORDER if t in highway]
+    known = [t for t in config.STREET_TYPE_ORDER if t in highway]
     return known[0] if known else sorted(highway)[0]
 
 def _read_phase1_table(path: Path) -> gpd.GeoDataFrame:
